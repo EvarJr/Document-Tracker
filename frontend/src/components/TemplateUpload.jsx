@@ -1,22 +1,32 @@
-import { useCallback, useRef, useState } from 'react';
-import { loadOpenCv } from '../lib/opencv-loader.js';
-import { detectDocumentCorners, computeSkewAngle, warpToFlat } from '../lib/documentDetection.js';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import './TemplateUpload.css';
 
 const STAGES = ['UPLOADING', 'DETECTING', 'ALIGNING', 'DONE'];
 
 export default function TemplateUpload() {
-  const [stage, setStage] = useState(null); // null until a file is picked
+  const [stage, setStage] = useState(null);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState(null);
   const [meta, setMeta] = useState(null);
   const [log, setLog] = useState([]);
   const [previewSrc, setPreviewSrc] = useState(null);
   const [flatSrc, setFlatSrc] = useState(null);
-  const [overlayCorners, setOverlayCorners] = useState(null); // scaled to preview size
+  const [overlayCorners, setOverlayCorners] = useState(null);
   const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
 
   const fileInputRef = useRef(null);
+  const workerRef = useRef(null);
+  const fileMetaRef = useRef(null); // holds filename/size/dims between async steps
+
+  // Worker is created once and reused across uploads — avoids re-downloading
+  // and re-initializing the OpenCV WASM runtime every time.
+  useEffect(() => {
+    workerRef.current = new Worker(
+      new URL('../lib/opencv.worker.js', import.meta.url),
+      { type: 'classic' }
+    );
+    return () => workerRef.current?.terminate();
+  }, []);
 
   const pushLog = (msg) => setLog((prev) => [...prev, msg]);
 
@@ -45,8 +55,7 @@ export default function TemplateUpload() {
       const img = await loadImage(dataUrl);
       setProgress(25);
 
-      // Cap working resolution for performance — keeps OpenCV fast even on large phone photos.
-      const MAX_DIM = 1400;
+      const MAX_DIM = 1000; // capped lower than before — keeps the worker fast on any image
       const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
       const workW = Math.round(img.width * scale);
       const workH = Math.round(img.height * scale);
@@ -56,65 +65,83 @@ export default function TemplateUpload() {
       canvas.height = workH;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, workW, workH);
+      const imageData = ctx.getImageData(0, 0, workW, workH);
 
-      setStage('DETECTING');
-      setProgress(40);
+      setPreviewDims({ w: workW, h: workH });
+      fileMetaRef.current = {
+        filename: file.name,
+        dimensions: `${img.width} × ${img.height} px`,
+        fileSize: formatBytes(file.size),
+      };
+
       pushLog('Edge detection pass');
+      setProgress(35);
 
-      const cv = await loadOpenCv();
-      const srcMat = cv.imread(canvas);
+      // Transfer the pixel buffer to the worker (zero-copy) instead of cloning it.
+      workerRef.current.postMessage(
+        { type: 'process', buffer: imageData.data.buffer, width: workW, height: workH },
+        [imageData.data.buffer]
+      );
+    } catch (err) {
+      console.error(err);
+      setError('Something went wrong reading this image. Please try again.');
+      setStage(null);
+    }
+  }, []);
 
-      const result = detectDocumentCorners(cv, srcMat);
+  // Wire up worker responses once, outside handleFile, so we don't attach
+  // duplicate listeners on every upload.
+  useEffect(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
 
-      if (!result) {
-        srcMat.delete();
-        setError('Could not detect document edges clearly. Try a photo with more contrast between the page and background.');
+    const onMessage = (e) => {
+      const msg = e.data;
+
+      if (msg.type === 'stage') {
+        if (msg.stage === 'DETECTING') {
+          setStage('DETECTING');
+          setProgress(50);
+          pushLog('Corner localization');
+        } else if (msg.stage === 'ALIGNING') {
+          setStage('ALIGNING');
+          setProgress(75);
+          pushLog('Perspective warp');
+        }
+        return;
+      }
+
+      if (msg.type === 'error') {
+        setError(msg.message);
         setStage(null);
         return;
       }
 
-      pushLog('Corner localization');
-      setProgress(60);
+      if (msg.type === 'result') {
+        setOverlayCorners(msg.corners);
 
-      const { corners, confidence } = result;
-      const skew = computeSkewAngle(corners);
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = msg.flatBitmap.width;
+        outCanvas.height = msg.flatBitmap.height;
+        const ctx = outCanvas.getContext('2d');
+        ctx.drawImage(msg.flatBitmap, 0, 0);
+        setFlatSrc(outCanvas.toDataURL('image/png'));
 
-      // Scale corners to preview display size (preview is shown at natural img size via CSS, so use workW/workH ratio)
-      setPreviewDims({ w: workW, h: workH });
-      setOverlayCorners(corners);
+        setMeta({
+          ...fileMetaRef.current,
+          skewAngle: msg.skewAngle.toFixed(1),
+          cornersDetected: 4,
+          confidence: (msg.confidence * 100).toFixed(1),
+        });
 
-      setStage('ALIGNING');
-      setProgress(80);
-      pushLog('Perspective warp');
+        pushLog('Output rendered');
+        setProgress(100);
+        setStage('DONE');
+      }
+    };
 
-      const outputW = 1000;
-      const outputH = Math.round(outputW * 1.294); // roughly letter/A4 ratio
-      const flatMat = warpToFlat(cv, srcMat, corners, outputW, outputH);
-
-      const outCanvas = document.createElement('canvas');
-      cv.imshow(outCanvas, flatMat);
-      setFlatSrc(outCanvas.toDataURL('image/png'));
-
-      srcMat.delete();
-      flatMat.delete();
-
-      setMeta({
-        filename: file.name,
-        dimensions: `${img.width} × ${img.height} px`,
-        fileSize: formatBytes(file.size),
-        skewAngle: skew.toFixed(1),
-        cornersDetected: 4,
-        confidence: (confidence * 100).toFixed(1),
-      });
-
-      pushLog('Output rendered');
-      setProgress(100);
-      setStage('DONE');
-    } catch (err) {
-      console.error(err);
-      setError('Something went wrong processing this image. Please try again.');
-      setStage(null);
-    }
+    worker.addEventListener('message', onMessage);
+    return () => worker.removeEventListener('message', onMessage);
   }, []);
 
   const onInputChange = (e) => {
@@ -246,8 +273,6 @@ function MetaRow({ label, value, accent }) {
 }
 
 function CornerOverlay({ corners, dims }) {
-  // corners are in working-canvas pixel space; dims.w/h match that same space,
-  // and the <img> is displayed at that same natural size via CSS, so coordinates map 1:1.
   const bracketSize = 24;
   return (
     <svg
@@ -266,13 +291,12 @@ function CornerOverlay({ corners, dims }) {
   );
 }
 
-// Draws an L-shaped bracket oriented toward the inside of the quad for each corner (0=TL,1=TR,2=BR,3=BL)
 function Bracket({ x, y, size, index }) {
   const dirs = [
-    [1, 1],   // top-left: arms go right and down
-    [-1, 1],  // top-right: arms go left and down
-    [-1, -1], // bottom-right: arms go left and up
-    [1, -1],  // bottom-left: arms go right and up
+    [1, 1],
+    [-1, 1],
+    [-1, -1],
+    [1, -1],
   ];
   const [dx, dy] = dirs[index];
   return (
@@ -282,8 +306,6 @@ function Bracket({ x, y, size, index }) {
     />
   );
 }
-
-// --- helpers ---
 
 function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {

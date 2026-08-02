@@ -1,12 +1,78 @@
-// Core CV pipeline: find the 4 corners of a document in a photo, then
-// warp/flatten it to a straight-on rectangular view.
+// Classic (non-module) Web Worker. Runs OpenCV.js entirely off the main
+// thread — this is what actually prevents the "Page Unresponsive" freeze,
+// independent of how well-optimized the detection code is. Even a
+// worst-case image can only ever block this worker thread, never the UI.
 
-/**
- * Finds the largest 4-sided contour in the image — assumed to be the document.
- * Returns [topLeft, topRight, bottomRight, bottomLeft] as {x, y} points in
- * the source image's pixel coordinates, or null if nothing suitable was found.
- */
-export function detectDocumentCorners(cv, srcMat) {
+self.importScripts('https://docs.opencv.org/4.9.0/opencv.js');
+
+const cvReady = new Promise((resolve) => {
+  if (self.cv && self.cv.Mat) {
+    resolve();
+  } else {
+    self.cv['onRuntimeInitialized'] = () => resolve();
+  }
+});
+
+self.onmessage = async (e) => {
+  if (e.data.type !== 'process') return;
+
+  await cvReady;
+  const cv = self.cv;
+  const { buffer, width, height } = e.data;
+
+  try {
+    const imageData = new ImageData(new Uint8ClampedArray(buffer), width, height);
+    const srcMat = cv.matFromImageData(imageData);
+
+    self.postMessage({ type: 'stage', stage: 'DETECTING' });
+    const result = detectDocumentCorners(cv, srcMat);
+
+    if (!result) {
+      srcMat.delete();
+      self.postMessage({
+        type: 'error',
+        message: 'Could not detect document edges clearly. Try a photo with more contrast between the page and background.',
+      });
+      return;
+    }
+
+    const { corners, confidence } = result;
+    const skewAngle = computeSkewAngle(corners);
+
+    self.postMessage({ type: 'stage', stage: 'ALIGNING' });
+
+    const outputW = 1000;
+    const outputH = Math.round(outputW * 1.294);
+    const flatMat = warpToFlat(cv, srcMat, corners, outputW, outputH);
+
+    const offCanvas = new OffscreenCanvas(outputW, outputH);
+    cv.imshow(offCanvas, flatMat);
+    const flatBitmap = offCanvas.transferToImageBitmap();
+
+    srcMat.delete();
+    flatMat.delete();
+
+    self.postMessage(
+      {
+        type: 'result',
+        corners,
+        confidence,
+        skewAngle,
+        flatBitmap,
+        workW: width,
+        workH: height,
+      },
+      [flatBitmap]
+    );
+  } catch (err) {
+    self.postMessage({ type: 'error', message: 'Processing failed: ' + err.message });
+  }
+};
+
+// --- CV pipeline (duplicated from documentDetection.js — classic workers
+// can't use ES module imports, so this is intentionally self-contained) ---
+
+function detectDocumentCorners(cv, srcMat) {
   const gray = new cv.Mat();
   const blurred = new cv.Mat();
   const edged = new cv.Mat();
@@ -28,12 +94,8 @@ export function detectDocumentCorners(cv, srcMat) {
 
     const imageArea = srcMat.rows * srcMat.cols;
     const minAreaThreshold = imageArea * 0.15;
-
-    // Busy images (screenshots, dense UI, cluttered backgrounds) can produce
-    // thousands of tiny contours. Filter by raw bounding-box area FIRST using
-    // cheap cv.boundingRect, before running the expensive arcLength/approxPolyDP
-    // on anything — this is what keeps the main thread from locking up.
     const count = contours.size();
+
     for (let i = 0; i < count; i++) {
       const cnt = contours.get(i);
       const rect = cv.boundingRect(cnt);
@@ -67,16 +129,13 @@ export function detectDocumentCorners(cv, srcMat) {
 
     const points = [];
     for (let i = 0; i < 4; i++) {
-      points.push({
-        x: bestApprox.data32S[i * 2],
-        y: bestApprox.data32S[i * 2 + 1],
-      });
+      points.push({ x: bestApprox.data32S[i * 2], y: bestApprox.data32S[i * 2 + 1] });
     }
     bestApprox.delete();
 
     return {
       corners: orderPoints(points),
-      confidence: Math.min(0.99, maxArea / (srcMat.rows * srcMat.cols)),
+      confidence: Math.min(0.99, maxArea / imageArea),
     };
   } finally {
     gray.delete();
@@ -89,43 +148,31 @@ export function detectDocumentCorners(cv, srcMat) {
   }
 }
 
-// Sorts 4 arbitrary points into [topLeft, topRight, bottomRight, bottomLeft]
 function orderPoints(pts) {
   const bySum = [...pts].sort((a, b) => a.x + a.y - (b.x + b.y));
   const tl = bySum[0];
   const br = bySum[3];
-
   const byDiff = [...pts].sort((a, b) => (a.y - a.x) - (b.y - b.x));
   const tr = byDiff[0];
   const bl = byDiff[3];
-
   return [tl, tr, br, bl];
 }
 
-/** Angle in degrees of the top edge relative to horizontal — for display only. */
-export function computeSkewAngle(corners) {
+function computeSkewAngle(corners) {
   const [tl, tr] = corners;
   const dx = tr.x - tl.x;
   const dy = tr.y - tl.y;
   return (Math.atan2(dy, dx) * 180) / Math.PI;
 }
 
-/** Warps the source image so the given 4 corners become a flat rectangle. */
-export function warpToFlat(cv, srcMat, corners, outputWidth = 1000, outputHeight = 1294) {
+function warpToFlat(cv, srcMat, corners, outputWidth, outputHeight) {
   const [tl, tr, br, bl] = corners;
 
   const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    tl.x, tl.y,
-    tr.x, tr.y,
-    br.x, br.y,
-    bl.x, bl.y,
+    tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y,
   ]);
-
   const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    0, 0,
-    outputWidth, 0,
-    outputWidth, outputHeight,
-    0, outputHeight,
+    0, 0, outputWidth, 0, outputWidth, outputHeight, 0, outputHeight,
   ]);
 
   const M = cv.getPerspectiveTransform(srcTri, dstTri);
@@ -143,6 +190,5 @@ export function warpToFlat(cv, srcMat, corners, outputWidth = 1000, outputHeight
   srcTri.delete();
   dstTri.delete();
   M.delete();
-
   return dst;
 }

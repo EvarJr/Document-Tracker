@@ -45,8 +45,16 @@ self.onmessage = async (e) => {
     const outputH = Math.round(outputW * 1.294);
     const flatMat = warpToFlat(cv, srcMat, corners, outputW, outputH);
 
+    // cv.imshow() checks `instanceof HTMLCanvasElement` internally, which
+    // doesn't exist inside a Worker — so we build ImageData manually instead.
+    // flatMat is RGBA (4 channels) after warpPerspective, which matches
+    // ImageData's format exactly, so this is a direct data copy.
+    const rgbaData = new Uint8ClampedArray(flatMat.data);
+    const flatImageData = new ImageData(rgbaData, outputW, outputH);
+
     const offCanvas = new OffscreenCanvas(outputW, outputH);
-    cv.imshow(offCanvas, flatMat);
+    const offCtx = offCanvas.getContext('2d');
+    offCtx.putImageData(flatImageData, 0, 0);
     const flatBitmap = offCanvas.transferToImageBitmap();
 
     srcMat.delete();

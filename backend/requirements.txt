@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+
+# Added in upcoming steps (kept here so requirements.txt stays a single source of truth):
+# opencv-python-headless   -> image alignment/preprocessing
+# pytesseract or paddleocr -> OCR
+# openpyxl                 -> Excel export
+# google-auth, google-auth-oauthlib, google-api-python-client -> Google Sign-In + Drive API

@@ -45,10 +45,12 @@ self.onmessage = async (e) => {
     const outputH = Math.round(outputW * 1.294);
     const flatMat = warpToFlat(cv, srcMat, corners, outputW, outputH);
 
-    // cv.imshow() checks `instanceof HTMLCanvasElement` internally, which
-    // doesn't exist inside a Worker — so we build ImageData manually instead.
-    // flatMat is RGBA (4 channels) after warpPerspective, which matches
-    // ImageData's format exactly, so this is a direct data copy.
+    // cv.imshow() checks `instanceof HTMLCanvasElement` internally, and that
+    // global doesn't exist at all inside a Worker (not just falsy — genuinely
+    // undefined), so referencing it throws a ReferenceError. We avoid calling
+    // cv.imshow() entirely and build ImageData ourselves instead. flatMat is
+    // RGBA (4 channels) after warpPerspective, which matches ImageData's
+    // format exactly, so this is just a direct buffer copy.
     const rgbaData = new Uint8ClampedArray(flatMat.data);
     const flatImageData = new ImageData(rgbaData, outputW, outputH);
 

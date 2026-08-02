@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Ping Render health endpoint
         run: |
-          curl -s -o /dev/null -w "Render responded with HTTP %{http_code}\n" https://YOUR-APP-NAME.onrender.com/health
+          curl -s -o /dev/null -w "Render responded with HTTP %{http_code}\n" https://document-tracker-x7bo.onrender.com/health

@@ -1,21 +1,57 @@
 import { useEffect, useState } from 'react';
 import { API_BASE_URL } from './config.js';
 import TemplateUpload from './components/TemplateUpload.jsx';
+import { loginWithGoogle, fetchCurrentUser, logout } from './lib/auth.js';
 import './styles/tokens.css';
 import './App.css';
 
 function App() {
   const [backendStatus, setBackendStatus] = useState('checking...');
-  const [tab, setTab] = useState('status'); // 'status' | 'upload'
+  const [tab, setTab] = useState('status');
+  const [user, setUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authNotice, setAuthNotice] = useState(null);
 
   useEffect(() => {
-    // Warm-up ping: fires the moment the app loads, so if Render's backend
-    // is asleep, the wake-up starts now instead of when the user submits a scan.
     fetch(`${API_BASE_URL}/health`)
       .then((res) => res.json())
       .then((data) => setBackendStatus(data.status === 'ok' ? 'connected' : 'unexpected response'))
       .catch(() => setBackendStatus('unreachable (backend may be waking up, try again shortly)'));
   }, []);
+
+  useEffect(() => {
+    // Handle the redirect back from Google (?auth=success|error|needs_consent),
+    // then clean the URL so refreshing the page doesn't re-trigger this.
+    const params = new URLSearchParams(window.location.search);
+    const authResult = params.get('auth');
+
+    if (authResult === 'success') {
+      setAuthNotice({ type: 'success', message: 'Signed in successfully.' });
+    } else if (authResult === 'needs_consent') {
+      setAuthNotice({
+        type: 'error',
+        message: 'Please approve Drive access when prompted — sign in again to try once more.',
+      });
+    } else if (authResult === 'error') {
+      setAuthNotice({ type: 'error', message: 'Sign-in failed. Please try again.' });
+    }
+
+    if (authResult) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('auth');
+      window.history.replaceState({}, '', url);
+    }
+
+    fetchCurrentUser().then((u) => {
+      setUser(u);
+      setAuthChecked(true);
+    });
+  }, []);
+
+  const handleLogout = async () => {
+    await logout();
+    setUser(null);
+  };
 
   return (
     <div className="app-root">
@@ -25,20 +61,35 @@ function App() {
           Document Scanner
         </div>
         <div className="nav-tabs">
-          <button
-            className={tab === 'status' ? 'active' : ''}
-            onClick={() => setTab('status')}
-          >
+          <button className={tab === 'status' ? 'active' : ''} onClick={() => setTab('status')}>
             System status
           </button>
-          <button
-            className={tab === 'upload' ? 'active' : ''}
-            onClick={() => setTab('upload')}
-          >
+          <button className={tab === 'upload' ? 'active' : ''} onClick={() => setTab('upload')}>
             Upload &amp; process
           </button>
         </div>
+        <div className="auth-area">
+          {!authChecked && <span className="mono-label">CHECKING...</span>}
+          {authChecked && user && (
+            <>
+              <span className="user-email">{user.email}</span>
+              <button className="auth-btn" onClick={handleLogout}>Sign out</button>
+            </>
+          )}
+          {authChecked && !user && (
+            <button className="auth-btn primary" onClick={loginWithGoogle}>
+              Sign in with Google
+            </button>
+          )}
+        </div>
       </nav>
+
+      {authNotice && (
+        <div className={`auth-notice ${authNotice.type}`}>
+          {authNotice.message}
+          <button className="dismiss-btn" onClick={() => setAuthNotice(null)}>×</button>
+        </div>
+      )}
 
       {tab === 'status' && (
         <div className="app-shell">
@@ -52,6 +103,7 @@ function App() {
             <ul>
               <li>Frontend: running</li>
               <li>Backend: {backendStatus}</li>
+              <li>Google account: {user ? `signed in (${user.email})` : 'not signed in'}</li>
             </ul>
           </section>
 
@@ -59,8 +111,8 @@ function App() {
             <h2>Coming next</h2>
             <ol>
               <li className="done">Template upload + OpenCV.js preprocessing</li>
-              <li>Field-box editor (draw &amp; label fields on canvas)</li>
-              <li>Google Sign-In + Drive storage</li>
+              <li className="done">Field-box editor (draw &amp; label fields on canvas)</li>
+              <li className={user ? 'done' : ''}>Google Sign-In + Drive storage</li>
               <li>Scan flow: align → crop → OCR → review</li>
               <li>Excel export</li>
             </ol>

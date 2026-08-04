@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import CornerEditor from './CornerEditor.jsx';
+import FieldBoxEditor from './FieldBoxEditor.jsx';
 import './TemplateUpload.css';
 
 const STAGES = ['UPLOADING', 'DETECTING', 'REVIEW', 'ALIGNING', 'DONE'];
@@ -16,6 +17,7 @@ export default function TemplateUpload() {
   const [editableCorners, setEditableCorners] = useState(null);
   const [confidence, setConfidence] = useState(null);
   const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
+  const [showFieldEditor, setShowFieldEditor] = useState(false);
 
   const fileInputRef = useRef(null);
   const workerRef = useRef(null);
@@ -43,6 +45,7 @@ export default function TemplateUpload() {
     setEditableCorners(null);
     setConfidence(null);
     rawBufferRef.current = null;
+    setShowFieldEditor(false);
   };
 
   const handleFile = useCallback(async (file) => {
@@ -179,6 +182,19 @@ export default function TemplateUpload() {
     if (file) handleFile(file);
   };
 
+  if (showFieldEditor && flatSrc) {
+    const suggestedName = fileMetaRef.current?.filename
+      ? fileMetaRef.current.filename.replace(/\.[^/.]+$/, '')
+      : '';
+    return (
+      <FieldBoxEditor
+        imageSrc={flatSrc}
+        initialTemplateName={suggestedName}
+        onBack={() => setShowFieldEditor(false)}
+      />
+    );
+  }
+
   return (
     <div className="upload-page">
       <div className="upload-header">
@@ -246,6 +262,9 @@ export default function TemplateUpload() {
             <div className="result-wrap">
               <div className="result-label mono-label">FLATTENED OUTPUT</div>
               <img src={flatSrc} alt="Flattened document" className="flat-img" />
+              <button className="confirm-btn" style={{ marginTop: 16 }} onClick={() => setShowFieldEditor(true)}>
+                Continue to field editor →
+              </button>
             </div>
           )}
 

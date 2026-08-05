@@ -1,0 +1,103 @@
+.templates-page {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: var(--space-8) var(--space-6);
+}
+
+.templates-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-6);
+}
+
+.templates-header h1 {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  margin: 0;
+}
+
+.refresh-btn {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  background: transparent;
+  border: 1px solid var(--color-grid);
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  color: var(--color-ink);
+}
+
+.refresh-btn:hover {
+  border-color: var(--color-ink);
+}
+
+.signin-prompt {
+  background: #fff;
+  border: 1px solid var(--color-grid);
+  border-radius: 8px;
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.signin-prompt p {
+  color: var(--color-ink-muted);
+  margin-bottom: var(--space-4);
+}
+
+.templates-error {
+  color: var(--color-accent-red);
+  font-size: 0.9rem;
+}
+
+.templates-empty {
+  color: var(--color-ink-muted);
+  font-size: 0.9rem;
+  background: #fff;
+  border: 1px solid var(--color-grid);
+  border-radius: 8px;
+  padding: var(--space-8);
+  text-align: center;
+}
+
+.templates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-4);
+}
+
+.template-card {
+  position: relative;
+  background: #fff;
+  border: 1px solid var(--color-grid);
+  border-radius: 8px;
+  padding: var(--space-6) var(--space-4);
+}
+
+.template-card-bracket {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-color: var(--color-accent-red);
+  border-style: solid;
+  border-width: 0;
+}
+.template-card-bracket.tl { top: 8px; left: 8px; border-top-width: 2px; border-left-width: 2px; }
+.template-card-bracket.tr { top: 8px; right: 8px; border-top-width: 2px; border-right-width: 2px; }
+.template-card-bracket.bl { bottom: 8px; left: 8px; border-bottom-width: 2px; border-left-width: 2px; }
+.template-card-bracket.br { bottom: 8px; right: 8px; border-bottom-width: 2px; border-right-width: 2px; }
+
+.template-card-name {
+  font-weight: 600;
+  margin: 0 0 4px;
+  word-break: break-word;
+}
+
+.template-card-meta {
+  margin: 0;
+}
+
+.templates-footnote {
+  margin-top: var(--space-6);
+  color: var(--color-ink-muted);
+}

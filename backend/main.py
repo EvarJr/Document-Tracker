@@ -8,6 +8,7 @@ All Google API calls happen here, server-side.
 
 import os
 import secrets
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,16 +18,20 @@ import google_oauth
 import security
 import drive
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "")
+# FRONTEND_URL should be the FULL site URL, including any path
+# (e.g. "https://evarjr.github.io/Document-Tracker") — this is what we
+# redirect the browser back to after login. CORS, however, only ever
+# matches on origin (scheme + host), never a path, so we derive that
+# separately below rather than needing a second env var for it.
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
+_parsed = urlparse(FRONTEND_URL)
+FRONTEND_ORIGIN = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed.scheme else ""
 
 app = FastAPI(title="Document Scanner API")
 
-# CORS is locked to the exact frontend origin, not "*" - required anyway
-# once cookies are involved (browsers reject wildcard origins when
-# allow_credentials is True), but it's the right call regardless.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL] if FRONTEND_URL else [],
+    allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN else [],
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],

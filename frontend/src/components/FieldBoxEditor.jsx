@@ -1,4 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { API_BASE_URL } from '../config.js';
+import { fetchCurrentUser, loginWithGoogle } from '../lib/auth.js';
 import './FieldBoxEditor.css';
 
 const FIELD_TYPES = ['text', 'number', 'date', 'checkbox'];
@@ -17,6 +19,7 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
   const [templateName, setTemplateName] = useState(initialTemplateName);
   const [drawingBox, setDrawingBox] = useState(null);
   const [savedMsg, setSavedMsg] = useState(null);
+  const [saving, setSaving] = useState(false);
 
   const svgRef = useRef(null);
   const dragState = useRef(null);
@@ -120,34 +123,55 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
     if (selectedId === id) setSelectedId(null);
   };
 
-  const saveTemplate = () => {
-    const template = {
-      name: templateName || 'Untitled template',
-      createdAt: new Date().toISOString(),
-      imageWidth: imgDims.w,
-      imageHeight: imgDims.h,
-      fields: fields.map((f) => ({
-        name: f.name,
-        type: f.type,
-        // Normalized 0-1 coordinates so this template still works if the
-        // flattened output is ever re-scaled later in the pipeline.
-        x: f.x / imgDims.w,
-        y: f.y / imgDims.h,
-        w: f.w / imgDims.w,
-        h: f.h / imgDims.h,
-      })),
-    };
-
-    // Interim storage until Google Drive integration lands (next roadmap item):
-    // keep a local copy so a future "Templates" library page can list these.
+  const saveTemplate = async () => {
+    setSaving(true);
     try {
-      localStorage.setItem(`template:${Date.now()}`, JSON.stringify(template));
-      setSavedMsg('Saved locally on this device. A downloadable copy was also created.');
-    } catch {
-      setSavedMsg('Could not save locally — a downloadable copy was still created below.');
-    }
+      const template = {
+        name: templateName || 'Untitled template',
+        createdAt: new Date().toISOString(),
+        imageWidth: imgDims.w,
+        imageHeight: imgDims.h,
+        fields: fields.map((f) => ({
+          name: f.name,
+          type: f.type,
+          x: f.x / imgDims.w,
+          y: f.y / imgDims.h,
+          w: f.w / imgDims.w,
+          h: f.h / imgDims.h,
+        })),
+      };
 
-    downloadJson(template, `${slugify(template.name)}.json`);
+      try {
+        localStorage.setItem(`template:${Date.now()}`, JSON.stringify(template));
+      } catch {
+        // not fatal
+      }
+      downloadJson(template, `${slugify(template.name)}.json`);
+
+      setSavedMsg('Checking sign-in status…');
+      const user = await fetchCurrentUser();
+
+      if (!user) {
+        localStorage.setItem('pendingTemplateSave', JSON.stringify(template));
+        setSavedMsg('Not signed in yet — redirecting to Google sign-in to save this to your Drive…');
+        setTimeout(() => loginWithGoogle(), 1200);
+        return;
+      }
+
+      const res = await fetch(`${API_BASE_URL}/templates`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(template),
+      });
+      if (!res.ok) throw new Error(`Save failed (${res.status})`);
+      setSavedMsg('Saved to your Google Drive, in the "DocumentScannerTemplates" folder. A local backup copy was also downloaded.');
+    } catch (err) {
+      console.error(err);
+      setSavedMsg('Could not save to Drive right now — a local backup copy was still downloaded. You can retry in a moment.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -163,8 +187,8 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
           value={templateName}
           onChange={(e) => setTemplateName(e.target.value)}
         />
-        <button className="save-template-btn" onClick={saveTemplate} disabled={fields.length === 0}>
-          Save template
+        <button className="save-template-btn" onClick={saveTemplate} disabled={fields.length === 0 || saving}>
+          {saving ? 'Saving…' : 'Save template'}
         </button>
       </div>
 

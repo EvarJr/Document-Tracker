@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { API_BASE_URL } from './config.js';
 import TemplateUpload from './components/TemplateUpload.jsx';
+import TemplatesLibrary from './components/TemplatesLibrary.jsx';
 import { loginWithGoogle, fetchCurrentUser, logout } from './lib/auth.js';
 import './styles/tokens.css';
 import './App.css';
@@ -42,9 +43,47 @@ function App() {
       window.history.replaceState({}, '', url);
     }
 
-    fetchCurrentUser().then((u) => {
+    fetchCurrentUser().then(async (u) => {
       setUser(u);
       setAuthChecked(true);
+
+      // If the user drew a template, wasn't signed in, and got redirected
+      // through Google login, the template JSON was stashed in localStorage
+      // (see FieldBoxEditor's saveTemplate) since the redirect wipes all
+      // React state. Finish that save automatically now that we're back
+      // and signed in, so the user doesn't have to redo any work.
+      if (u) {
+        const pending = localStorage.getItem('pendingTemplateSave');
+        if (pending) {
+          let templateName = 'template';
+          try {
+            const res = await fetch(`${API_BASE_URL}/templates`, {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: pending,
+            });
+            const parsed = JSON.parse(pending);
+            templateName = parsed.name || templateName;
+
+            if (res.ok) {
+              setAuthNotice({
+                type: 'success',
+                message: `Signed in — "${templateName}" was saved to your Google Drive.`,
+              });
+            } else {
+              setAuthNotice({
+                type: 'error',
+                message: `Signed in, but saving "${templateName}" failed. Open the field editor and click Save template again.`,
+              });
+            }
+          } catch (err) {
+            console.error(err);
+          } finally {
+            localStorage.removeItem('pendingTemplateSave');
+          }
+        }
+      }
     });
   }, []);
 
@@ -66,6 +105,9 @@ function App() {
           </button>
           <button className={tab === 'upload' ? 'active' : ''} onClick={() => setTab('upload')}>
             Upload &amp; process
+          </button>
+          <button className={tab === 'templates' ? 'active' : ''} onClick={() => setTab('templates')}>
+            Templates
           </button>
         </div>
         <div className="auth-area">
@@ -121,6 +163,7 @@ function App() {
       )}
 
       {tab === 'upload' && <TemplateUpload />}
+      {tab === 'templates' && <TemplatesLibrary user={user} authChecked={authChecked} />}
     </div>
   );
 }

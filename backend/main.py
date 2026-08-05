@@ -1,28 +1,38 @@
 """
 Document Scanner - Backend entrypoint
 
-Auth model: backend-for-frontend OAuth. The frontend never touches a
-Google token directly - it only ever holds an httpOnly session cookie.
-All Google API calls happen here, server-side.
+Auth model: backend-for-frontend OAuth, using a bearer token instead of a
+cross-site cookie for the frontend<->backend session link.
+
+Why not a cookie: the frontend (github.io) and backend (onrender.com) are
+different sites, so a session cookie between them needs SameSite=None -
+exactly the kind of cookie modern browsers increasingly restrict or block
+as third-party tracking protection (Safari and Firefox block it outright
+by default; Chrome's policy has shifted more than once). Rather than
+depend on that working consistently for every visitor, the backend hands
+the frontend an explicit bearer token after login, which the frontend
+attaches manually via an Authorization header on every request. This
+can't be silently dropped by cookie policy since it isn't a cookie.
+
+The OAuth *login* flow itself still uses one short-lived cookie
+(STATE_COOKIE) for CSRF protection - that one is same-site the whole
+time (set and read back on this same backend domain during a top-level
+browser redirect), so it's unaffected by any of the above.
 """
 
 import os
 import secrets
-from urllib.parse import urlparse
+import time
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from urllib.parse import urlparse
 
 import google_oauth
 import security
 import drive
 
-# FRONTEND_URL should be the FULL site URL, including any path
-# (e.g. "https://evarjr.github.io/Document-Tracker") — this is what we
-# redirect the browser back to after login. CORS, however, only ever
-# matches on origin (scheme + host), never a path, so we derive that
-# separately below rather than needing a second env var for it.
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _parsed = urlparse(FRONTEND_URL)
 FRONTEND_ORIGIN = f"{_parsed.scheme}://{_parsed.netloc}" if _parsed.scheme else ""
@@ -32,13 +42,28 @@ app = FastAPI(title="Document Scanner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN else [],
-    allow_credentials=True,
+    allow_credentials=False,  # no longer needed - auth travels via header, not cookies
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
-SESSION_COOKIE = "session"
 STATE_COOKIE = "oauth_state"
+
+# Short-lived one-time exchange codes: code -> (encrypted_session_token, expires_at).
+# Deliberately in-memory and short-lived (2 min) by design - unlike the actual
+# session, this only needs to survive the few seconds between the OAuth
+# redirect landing and the frontend's follow-up exchange call, so an
+# occasional Render restart mid-flight (rare) just means a retry, not a
+# real problem.
+_exchange_codes: dict[str, tuple[str, float]] = {}
+EXCHANGE_CODE_TTL = 120
+
+
+def _prune_expired_codes():
+    now = time.time()
+    expired = [c for c, (_, exp) in _exchange_codes.items() if exp < now]
+    for c in expired:
+        _exchange_codes.pop(c, None)
 
 
 @app.get("/health")
@@ -62,9 +87,6 @@ async def google_login():
     auth_url = google_oauth.build_auth_url(state)
 
     resp = RedirectResponse(auth_url)
-    # SameSite=Lax is correct here (not None) - this cookie only needs to
-    # survive a top-level redirect back from Google, and Lax is the more
-    # restrictive, safer choice for anything that doesn't need cross-site delivery.
     resp.set_cookie(
         STATE_COOKIE, state,
         httponly=True, secure=True, samesite="lax", max_age=600,
@@ -79,8 +101,6 @@ async def google_callback(request: Request, code: str | None = None, state: str 
 
     saved_state = request.cookies.get(STATE_COOKIE)
     if not state or not saved_state or state != saved_state:
-        # Mismatched/missing state means this request didn't originate from
-        # our own login flow - reject it outright rather than guessing.
         raise HTTPException(status_code=400, detail="Invalid OAuth state.")
 
     if not code:
@@ -91,34 +111,55 @@ async def google_callback(request: Request, code: str | None = None, state: str 
 
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
-        # Google only issues a refresh_token on the first-ever consent for
-        # this app+account. If the user previously authorized and revoked
-        # some other way, we won't get one back here - send them through
-        # consent again rather than silently failing later.
         return RedirectResponse(f"{FRONTEND_URL}?auth=needs_consent")
 
-    session_cookie = security.encrypt_session({
+    session_token = security.encrypt_session({
         "refresh_token": refresh_token,
         "email": userinfo.get("email"),
     })
 
-    resp = RedirectResponse(f"{FRONTEND_URL}?auth=success")
+    # Don't put the actual session token in the URL - it's a long-lived
+    # credential and URLs leak into browser history, referrer headers, and
+    # server logs. Instead, hand back a short opaque one-time code, and
+    # make the frontend exchange it for the real token via a POST body.
+    _prune_expired_codes()
+    exchange_code = secrets.token_urlsafe(24)
+    _exchange_codes[exchange_code] = (session_token, time.time() + EXCHANGE_CODE_TTL)
+
+    resp = RedirectResponse(f"{FRONTEND_URL}?auth=success&code={exchange_code}")
     resp.delete_cookie(STATE_COOKIE)
-    # SameSite=None is required here because the frontend (github.io) and
-    # backend (onrender.com) are different sites, so this cookie must be
-    # sent on cross-site requests - which is why Secure is mandatory too.
-    resp.set_cookie(
-        SESSION_COOKIE, session_cookie,
-        httponly=True, secure=True, samesite="none", max_age=60 * 60 * 24 * 30,
-    )
     return resp
 
 
-def _get_session(request: Request) -> dict:
-    raw = request.cookies.get(SESSION_COOKIE)
-    data = security.decrypt_session(raw) if raw else None
+@app.post("/auth/exchange")
+async def auth_exchange(request: Request):
+    body = await request.json()
+    code = body.get("code")
+
+    entry = _exchange_codes.pop(code, None) if code else None
+    if not entry:
+        raise HTTPException(status_code=400, detail="Invalid or already-used code.")
+
+    session_token, expires_at = entry
+    if time.time() > expires_at:
+        raise HTTPException(status_code=400, detail="Code expired - please sign in again.")
+
+    data = security.decrypt_session(session_token)
     if not data:
+        raise HTTPException(status_code=400, detail="Invalid session.")
+
+    return {"session_token": session_token, "email": data["email"]}
+
+
+def _get_session(request: Request) -> dict:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not signed in.")
+
+    token = auth_header[len("Bearer "):]
+    data = security.decrypt_session(token)
+    if not data:
+        raise HTTPException(status_code=401, detail="Invalid session.")
     return data
 
 
@@ -136,15 +177,12 @@ async def auth_me(request: Request):
 
 @app.post("/auth/logout")
 async def logout(request: Request):
-    raw = request.cookies.get(SESSION_COOKIE)
-    if raw:
-        data = security.decrypt_session(raw)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        data = security.decrypt_session(auth_header[len("Bearer "):])
         if data and data.get("refresh_token"):
             await google_oauth.revoke_token(data["refresh_token"])
-
-    resp = Response(status_code=204)
-    resp.delete_cookie(SESSION_COOKIE, samesite="none", secure=True)
-    return resp
+    return Response(status_code=204)
 
 
 # --- Template routes (Drive-backed) ---

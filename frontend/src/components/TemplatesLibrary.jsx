@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { API_BASE_URL } from '../config.js';
-import { loginWithGoogle } from '../lib/auth.js';
+import { loginWithGoogle, authFetch } from '../lib/auth.js';
 import './TemplatesLibrary.css';
 
 export default function TemplatesLibrary({ user, authChecked }) {
@@ -12,7 +12,7 @@ export default function TemplatesLibrary({ user, authChecked }) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/templates`, { credentials: 'include' });
+      const res = await authFetch(`${API_BASE_URL}/templates`);
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       const data = await res.json();
       setTemplates(data.templates || []);

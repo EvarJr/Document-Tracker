@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { API_BASE_URL } from '../config.js';
-import { fetchCurrentUser, loginWithGoogle } from '../lib/auth.js';
+import { fetchCurrentUser, loginWithGoogle, authFetch } from '../lib/auth.js';
 import './FieldBoxEditor.css';
 
 const FIELD_TYPES = ['text', 'number', 'date', 'checkbox'];
@@ -158,9 +158,8 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
         return;
       }
 
-      const res = await fetch(`${API_BASE_URL}/templates`, {
+      const res = await authFetch(`${API_BASE_URL}/templates`, {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(template),
       });

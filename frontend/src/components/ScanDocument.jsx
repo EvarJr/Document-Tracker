@@ -3,14 +3,29 @@ import { createWorker } from 'tesseract.js';
 import { API_BASE_URL } from '../config.js';
 import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
+import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
 import './ScanDocument.css';
 
 const FLAT_W = 1000;
 const FLAT_H = Math.round(FLAT_W * 1.294); // must match backend/worker's flatten output size
-const CAPTURE_STAGES = ['UPLOADING', 'DETECTING', 'REVIEW', 'ALIGNING', 'DONE'];
+
+function newBatchItem(id, file) {
+  return {
+    id,
+    file,
+    previewSrc: null,
+    previewDims: { w: 0, h: 0 },
+    stage: null, // UPLOADING | DETECTING | REVIEW_CORNERS | ALIGNING_WARP | ALIGN_FIELDS | DONE
+    error: null,
+    editableCorners: null,
+    confidence: null,
+    flatSrc: null,
+    alignOffset: { dx: 0, dy: 0 },
+  };
+}
 
 export default function ScanDocument({ user, authChecked }) {
-  const [phase, setPhase] = useState('select'); // select | capture | ocr | review
+  const [phase, setPhase] = useState('select'); // select | prep | ocr | review
 
   // --- template selection ---
   const [templates, setTemplates] = useState(null);
@@ -18,27 +33,27 @@ export default function ScanDocument({ user, authChecked }) {
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [loadingTemplate, setLoadingTemplate] = useState(false);
 
-  // --- capture (upload -> detect -> correct -> flatten), same pattern as TemplateUpload ---
-  const [stage, setStage] = useState(null);
-  const [progress, setProgress] = useState(0);
-  const [captureError, setCaptureError] = useState(null);
-  const [previewSrc, setPreviewSrc] = useState(null);
-  const [flatSrc, setFlatSrc] = useState(null);
-  const [editableCorners, setEditableCorners] = useState(null);
-  const [confidence, setConfidence] = useState(null);
-  const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
+  // --- batch prep (per-image: upload -> detect -> correct corners -> flatten -> align offset) ---
+  const [batch, setBatch] = useState([]);
+  const [currentIndex, setCurrentIndex] = useState(0);
 
-  const workerCvRef = useRef(null); // opencv.worker.js instance
-  const rawBufferRef = useRef(null);
-
-  // --- OCR ---
+  // --- OCR + review ---
   const [ocrProgressText, setOcrProgressText] = useState('');
-  const [results, setResults] = useState([]); // [{name, type, value, lowConfidence}]
+  const [allResults, setAllResults] = useState([]); // parallel array to batch
+  const [reviewIndex, setReviewIndex] = useState(0);
+
+  const workerCvRef = useRef(null);
+  const rawBuffersRef = useRef({}); // id -> ArrayBuffer copy (kept off React state - large binary data)
+  const awaitingIndexRef = useRef(null); // which batch index the worker's next response belongs to
 
   useEffect(() => {
     workerCvRef.current = new Worker(new URL('../lib/opencv.worker.js', import.meta.url), { type: 'classic' });
     return () => workerCvRef.current?.terminate();
   }, []);
+
+  const patchItem = (index, patch) => {
+    setBatch((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
+  };
 
   const loadTemplates = useCallback(async () => {
     setTemplatesError(null);
@@ -64,7 +79,8 @@ export default function ScanDocument({ user, authChecked }) {
       if (!res.ok) throw new Error('Failed to load template content');
       const content = await res.json();
       setSelectedTemplate(content);
-      setPhase('capture');
+      setPhase('prep');
+      setBatch([]);
     } catch (err) {
       console.error(err);
       setTemplatesError('Could not open that template. Try again.');
@@ -73,28 +89,13 @@ export default function ScanDocument({ user, authChecked }) {
     }
   };
 
-  // --- capture handlers (mirrors TemplateUpload's pipeline) ---
+  // --- per-item processing (mirrors TemplateUpload's detect/warp pipeline) ---
 
-  const resetCapture = () => {
-    setStage(null);
-    setProgress(0);
-    setCaptureError(null);
-    setPreviewSrc(null);
-    setFlatSrc(null);
-    setEditableCorners(null);
-    setConfidence(null);
-    rawBufferRef.current = null;
-  };
-
-  const handleFile = useCallback(async (file) => {
-    if (!file) return;
-    resetCapture();
-    setStage('UPLOADING');
-    setProgress(15);
+  const processItem = useCallback(async (index, item) => {
+    patchItem(index, { stage: 'UPLOADING', error: null });
 
     try {
-      const dataUrl = await readFileAsDataUrl(file);
-      setPreviewSrc(dataUrl);
+      const dataUrl = await readFileAsDataUrl(item.file);
       const img = await loadImage(dataUrl);
 
       const MAX_DIM = 1000;
@@ -108,32 +109,64 @@ export default function ScanDocument({ user, authChecked }) {
       canvas.getContext('2d').drawImage(img, 0, 0, workW, workH);
       const imageData = canvas.getContext('2d').getImageData(0, 0, workW, workH);
 
-      rawBufferRef.current = imageData.data.buffer.slice(0);
-      setPreviewDims({ w: workW, h: workH });
+      rawBuffersRef.current[item.id] = imageData.data.buffer.slice(0);
 
-      setStage('DETECTING');
-      setProgress(40);
+      patchItem(index, { previewSrc: dataUrl, previewDims: { w: workW, h: workH }, stage: 'DETECTING' });
+
+      awaitingIndexRef.current = index;
       workerCvRef.current.postMessage(
         { type: 'detect', buffer: imageData.data.buffer, width: workW, height: workH },
         [imageData.data.buffer]
       );
     } catch (err) {
       console.error(err);
-      setCaptureError('Could not read this image. Please try again.');
-      setStage(null);
+      patchItem(index, { error: 'Could not read this image. Please try again.', stage: null });
     }
   }, []);
 
-  const confirmAndFlatten = useCallback(() => {
-    if (!editableCorners || !rawBufferRef.current) return;
-    setStage('ALIGNING');
-    setProgress(80);
-    const bufferCopy = rawBufferRef.current.slice(0);
+  const onFilesChosen = (files) => {
+    const fileArray = Array.from(files);
+    if (fileArray.length === 0) return;
+
+    const items = fileArray.map((f, i) => newBatchItem(`${Date.now()}_${i}`, f));
+    setBatch(items);
+    setCurrentIndex(0);
+    // item is passed directly (not read back from state), so there's no
+    // risk of this seeing a stale/empty `batch` from before setBatch above
+    // has actually applied.
+    processItem(0, items[0]);
+  };
+
+  const confirmCorners = (index) => {
+    const item = batch[index];
+    if (!item?.editableCorners) return;
+
+    patchItem(index, { stage: 'ALIGNING_WARP' });
+    const buffer = rawBuffersRef.current[item.id];
+    const bufferCopy = buffer.slice(0);
+    awaitingIndexRef.current = index;
     workerCvRef.current.postMessage(
-      { type: 'warp', buffer: bufferCopy, width: previewDims.w, height: previewDims.h, corners: editableCorners },
+      {
+        type: 'warp',
+        buffer: bufferCopy,
+        width: item.previewDims.w,
+        height: item.previewDims.h,
+        corners: item.editableCorners,
+      },
       [bufferCopy]
     );
-  }, [editableCorners, previewDims]);
+  };
+
+  const confirmAlignment = (index) => {
+    patchItem(index, { stage: 'DONE' });
+    const nextIndex = index + 1;
+    if (nextIndex < batch.length) {
+      setCurrentIndex(nextIndex);
+      processItem(nextIndex, batch[nextIndex]);
+    } else {
+      setPhase('ocr');
+    }
+  };
 
   useEffect(() => {
     const w = workerCvRef.current;
@@ -141,16 +174,21 @@ export default function ScanDocument({ user, authChecked }) {
 
     const onMessage = (e) => {
       const msg = e.data;
+      const index = awaitingIndexRef.current;
+      if (index === null) return;
+
       if (msg.type === 'error') {
-        setCaptureError(msg.message);
-        setStage(null);
+        patchItem(index, { error: msg.message, stage: null });
         return;
       }
       if (msg.type === 'detect-result') {
-        setConfidence(msg.confidence);
-        setEditableCorners(msg.corners || defaultCorners(previewDims.w, previewDims.h));
-        setStage('REVIEW');
-        setProgress(55);
+        const item = batch[index];
+        const dims = item?.previewDims || { w: 0, h: 0 };
+        patchItem(index, {
+          confidence: msg.confidence,
+          editableCorners: msg.corners || defaultCorners(dims.w, dims.h),
+          stage: 'REVIEW_CORNERS',
+        });
         return;
       }
       if (msg.type === 'warp-result') {
@@ -158,104 +196,118 @@ export default function ScanDocument({ user, authChecked }) {
         outCanvas.width = msg.flatBitmap.width;
         outCanvas.height = msg.flatBitmap.height;
         outCanvas.getContext('2d').drawImage(msg.flatBitmap, 0, 0);
-        setFlatSrc(outCanvas.toDataURL('image/png'));
-        setProgress(100);
-        setStage('DONE');
+        patchItem(index, { flatSrc: outCanvas.toDataURL('image/png'), stage: 'ALIGN_FIELDS' });
       }
     };
 
     w.addEventListener('message', onMessage);
     return () => w.removeEventListener('message', onMessage);
-  }, [previewDims]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batch]);
 
-  // --- OCR extraction, once flattened ---
+  // --- batch OCR, once every item has confirmed corners + alignment ---
 
-  const runOcr = useCallback(async () => {
-    if (!flatSrc || !selectedTemplate) return;
-    setPhase('ocr');
-
-    const img = await loadImage(flatSrc);
-    const fullCanvas = document.createElement('canvas');
-    fullCanvas.width = FLAT_W;
-    fullCanvas.height = FLAT_H;
-    fullCanvas.getContext('2d').drawImage(img, 0, 0, FLAT_W, FLAT_H);
-
+  const runBatchOcr = useCallback(async () => {
     const worker = await createWorker('eng');
-    const collected = [];
+    const results = [];
 
     try {
-      const fields = selectedTemplate.fields || [];
-      for (let i = 0; i < fields.length; i++) {
-        const f = fields[i];
-        setOcrProgressText(`Reading field ${i + 1} of ${fields.length}: ${f.name} (adjusting image quality…)`);
+      for (let docIndex = 0; docIndex < batch.length; docIndex++) {
+        const item = batch[docIndex];
+        const img = await loadImage(item.flatSrc);
+        const fullCanvas = document.createElement('canvas');
+        fullCanvas.width = FLAT_W;
+        fullCanvas.height = FLAT_H;
+        fullCanvas.getContext('2d').drawImage(img, 0, 0, FLAT_W, FLAT_H);
 
-        const px = Math.round(f.x * FLAT_W);
-        const py = Math.round(f.y * FLAT_H);
-        const pw = Math.round(f.w * FLAT_W);
-        const ph = Math.round(f.h * FLAT_H);
+        const fields = selectedTemplate.fields || [];
+        const docResults = [];
 
-        const cropCanvas = document.createElement('canvas');
-        cropCanvas.width = pw;
-        cropCanvas.height = ph;
-        cropCanvas.getContext('2d').drawImage(fullCanvas, px, py, pw, ph, 0, 0, pw, ph);
-
-        let ocrCanvas = cropCanvas;
-        let diagnostics = null;
-        try {
-          const cropData = cropCanvas.getContext('2d').getImageData(0, 0, pw, ph);
-          const pre = await requestPreprocess(workerCvRef.current, cropData.data.buffer, pw, ph);
-          diagnostics = pre.diagnostics;
-
-          const preCanvas = document.createElement('canvas');
-          preCanvas.width = pre.width;
-          preCanvas.height = pre.height;
-          preCanvas.getContext('2d').putImageData(
-            new ImageData(new Uint8ClampedArray(pre.buffer), pre.width, pre.height),
-            0, 0
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i];
+          setOcrProgressText(
+            `Document ${docIndex + 1} of ${batch.length} — field ${i + 1} of ${fields.length}: ${f.name}`
           );
-          ocrCanvas = preCanvas;
-        } catch (err) {
-          // Preprocessing is a quality improvement, not a hard requirement —
-          // fall back to the raw crop rather than failing the whole field.
-          console.error('Preprocessing failed for field', f.name, err);
+
+          const px = clampInt(f.x * FLAT_W + item.alignOffset.dx, 0, FLAT_W - 1);
+          const py = clampInt(f.y * FLAT_H + item.alignOffset.dy, 0, FLAT_H - 1);
+          const pw = Math.max(1, Math.min(Math.round(f.w * FLAT_W), FLAT_W - px));
+          const ph = Math.max(1, Math.min(Math.round(f.h * FLAT_H), FLAT_H - py));
+
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = pw;
+          cropCanvas.height = ph;
+          cropCanvas.getContext('2d').drawImage(fullCanvas, px, py, pw, ph, 0, 0, pw, ph);
+
+          let ocrCanvas = cropCanvas;
+          let diagnostics = null;
+          try {
+            const cropData = cropCanvas.getContext('2d').getImageData(0, 0, pw, ph);
+            const pre = await requestPreprocess(workerCvRef.current, cropData.data.buffer, pw, ph);
+            diagnostics = pre.diagnostics;
+            const preCanvas = document.createElement('canvas');
+            preCanvas.width = pre.width;
+            preCanvas.height = pre.height;
+            preCanvas.getContext('2d').putImageData(
+              new ImageData(new Uint8ClampedArray(pre.buffer), pre.width, pre.height),
+              0, 0
+            );
+            ocrCanvas = preCanvas;
+          } catch (err) {
+            console.error('Preprocessing failed for field', f.name, err);
+          }
+
+          let text = '';
+          let ocrConfidence = 0;
+          try {
+            const { data } = await worker.recognize(ocrCanvas);
+            text = (data.text || '').trim();
+            ocrConfidence = data.confidence ?? 0;
+          } catch (err) {
+            console.error('OCR failed for field', f.name, err);
+          }
+
+          docResults.push({ name: f.name, type: f.type, value: text, lowConfidence: ocrConfidence < 60, diagnostics });
         }
 
-        let text = '';
-        let ocrConfidence = 0;
-        try {
-          const { data } = await worker.recognize(ocrCanvas);
-          text = (data.text || '').trim();
-          ocrConfidence = data.confidence ?? 0;
-        } catch (err) {
-          console.error('OCR failed for field', f.name, err);
-        }
-
-        collected.push({
-          name: f.name,
-          type: f.type,
-          value: text,
-          lowConfidence: ocrConfidence < 60,
-          diagnostics,
-        });
+        results.push(docResults);
       }
     } finally {
       await worker.terminate();
     }
 
-    setResults(collected);
+    setAllResults(results);
     setOcrProgressText('');
+    setReviewIndex(0);
     setPhase('review');
-  }, [flatSrc, selectedTemplate]);
+  }, [batch, selectedTemplate]);
 
-  const updateResult = (index, value) => {
-    setResults((prev) => prev.map((r, i) => (i === index ? { ...r, value } : r)));
+  useEffect(() => {
+    if (phase === 'ocr') runBatchOcr();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  const updateResult = (docIndex, fieldIndex, value) => {
+    setAllResults((prev) =>
+      prev.map((doc, di) => (di === docIndex ? doc.map((r, fi) => (fi === fieldIndex ? { ...r, value } : r)) : doc))
+    );
+  };
+
+  const scanMoreWithTemplate = () => {
+    setBatch([]);
+    setCurrentIndex(0);
+    setAllResults([]);
+    setReviewIndex(0);
+    setPhase('prep');
   };
 
   const startOver = () => {
-    setPhase('select');
     setSelectedTemplate(null);
-    resetCapture();
-    setResults([]);
+    setBatch([]);
+    setCurrentIndex(0);
+    setAllResults([]);
+    setReviewIndex(0);
+    setPhase('select');
   };
 
   // --- render ---
@@ -290,12 +342,7 @@ export default function ScanDocument({ user, authChecked }) {
         {templates && templates.length > 0 && (
           <div className="template-picker-grid">
             {templates.map((t) => (
-              <button
-                key={t.id}
-                className="template-picker-card"
-                onClick={() => pickTemplate(t)}
-                disabled={loadingTemplate}
-              >
+              <button key={t.id} className="template-picker-card" onClick={() => pickTemplate(t)} disabled={loadingTemplate}>
                 {t.name.replace(/\.json$/, '')}
               </button>
             ))}
@@ -305,68 +352,100 @@ export default function ScanDocument({ user, authChecked }) {
     );
   }
 
-  if (phase === 'capture') {
+  if (phase === 'prep') {
+    if (batch.length === 0) {
+      return (
+        <div className="scan-page">
+          <div className="scan-header">
+            <h1>Scan: {selectedTemplate?.name}</h1>
+            <button className="back-btn" onClick={startOver}>← Choose different template</button>
+          </div>
+          <div className="scan-canvas-area">
+            <label className="dropzone">
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                hidden
+                onChange={(e) => e.target.files && onFilesChosen(e.target.files)}
+              />
+              <div className="dropzone-text">
+                <p className="mono-label">DROP OR CLICK TO UPLOAD ONE OR MORE FILLED DOCUMENTS</p>
+                <p className="scan-subtitle">You can select multiple photos at once — each gets aligned before scanning.</p>
+              </div>
+            </label>
+          </div>
+        </div>
+      );
+    }
+
+    const item = batch[currentIndex];
+    const total = batch.length;
+
     return (
       <div className="scan-page">
         <div className="scan-header">
-          <h1>Scan: {selectedTemplate?.name}</h1>
-          {stage && <span className="mono-label stage-label">{stage}...</span>}
+          <h1>Document {currentIndex + 1} of {total}</h1>
+          {item.stage && <span className="mono-label stage-label">{item.stage.replace(/_/g, ' ')}...</span>}
           <button className="back-btn" onClick={startOver}>← Choose different template</button>
         </div>
 
-        <div
-          className="scan-canvas-area"
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) handleFile(f); }}
-        >
-          {!previewSrc && (
-            <label className="dropzone">
-              <input type="file" accept="image/*" hidden onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
-              <p className="mono-label">DROP OR CLICK TO UPLOAD THE FILLED DOCUMENT</p>
-            </label>
-          )}
+        <p className="scan-subtitle">
+          Correct edges and alignment for every document before scanning begins — document {currentIndex + 1} of {total}.
+        </p>
 
-          {previewSrc && !flatSrc && (
-            <div className="image-wrap" style={{ maxWidth: previewDims.w || 600 }}>
-              <img src={previewSrc} alt="Uploaded scan" />
-              {editableCorners && stage === 'REVIEW' && (
-                <CornerEditor corners={editableCorners} dims={previewDims} onChange={setEditableCorners} />
+        <div className="scan-canvas-area">
+          {item.previewSrc && (item.stage === 'DETECTING' || item.stage === 'REVIEW_CORNERS') && (
+            <div className="image-wrap" style={{ maxWidth: item.previewDims.w || 600 }}>
+              <img src={item.previewSrc} alt="Uploaded scan" />
+              {item.editableCorners && item.stage === 'REVIEW_CORNERS' && (
+                <CornerEditor
+                  corners={item.editableCorners}
+                  dims={item.previewDims}
+                  onChange={(corners) => patchItem(currentIndex, { editableCorners: corners })}
+                />
               )}
             </div>
           )}
 
-          {stage === 'REVIEW' && (
+          {item.stage === 'REVIEW_CORNERS' && (
             <div className="review-controls">
-              {confidence !== null && confidence < 0.5 && (
+              {item.confidence !== null && item.confidence < 0.5 && (
                 <p className="review-warning">Low-confidence detection — drag the corners to match the page edges.</p>
               )}
-              <button className="confirm-btn" onClick={confirmAndFlatten}>Confirm &amp; flatten</button>
+              <button className="confirm-btn" onClick={() => confirmCorners(currentIndex)}>Confirm edges</button>
             </div>
           )}
 
-          {flatSrc && (
-            <div className="result-wrap">
-              <img src={flatSrc} alt="Flattened scan" className="flat-img" />
-              <button className="confirm-btn" style={{ marginTop: 16 }} onClick={runOcr}>
-                Extract fields with OCR →
-              </button>
-            </div>
-          )}
-
-          {captureError && <div className="scan-error">{captureError}</div>}
-
-          {stage && (
-            <div className="progress-block">
-              <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${progress}%` }} />
+          {item.stage === 'ALIGN_FIELDS' && item.flatSrc && (
+            <div className="align-step">
+              <p className="scan-subtitle">
+                Drag the image to line up the highlighted first row with the actual field positions, then confirm.
+              </p>
+              <div style={{ maxWidth: 600, margin: '0 auto' }}>
+                <AlignmentOffsetEditor
+                  imageSrc={item.flatSrc}
+                  fields={selectedTemplate.fields || []}
+                  dims={{ w: FLAT_W, h: FLAT_H }}
+                  offset={item.alignOffset}
+                  onOffsetChange={(offset) => patchItem(currentIndex, { alignOffset: offset })}
+                />
               </div>
-              <div className="progress-stages">
-                {CAPTURE_STAGES.map((s) => (
-                  <span key={s} className={`mono-label ${CAPTURE_STAGES.indexOf(s) <= CAPTURE_STAGES.indexOf(stage) ? 'stage-active' : ''}`}>{s}</span>
-                ))}
+              <div className="review-controls">
+                <button
+                  className="back-btn"
+                  onClick={() => patchItem(currentIndex, { alignOffset: { dx: 0, dy: 0 } })}
+                >
+                  Reset alignment
+                </button>
+                <button className="confirm-btn" onClick={() => confirmAlignment(currentIndex)}>
+                  Confirm alignment {currentIndex + 1 < total ? '→ next document' : '→ start scanning'}
+                </button>
               </div>
             </div>
           )}
+
+          {item.error && <div className="scan-error">{item.error}</div>}
         </div>
       </div>
     );
@@ -383,15 +462,26 @@ export default function ScanDocument({ user, authChecked }) {
   }
 
   // phase === 'review'
+  const doc = batch[reviewIndex];
+  const results = allResults[reviewIndex] || [];
+
   return (
     <div className="scan-page">
       <div className="scan-header">
         <h1>Review extracted data</h1>
-        <button className="back-btn" onClick={startOver}>← Scan another</button>
+        {batch.length > 1 && (
+          <div className="doc-nav">
+            <button disabled={reviewIndex === 0} onClick={() => setReviewIndex((i) => i - 1)}>← Prev</button>
+            <span className="mono-label">DOCUMENT {reviewIndex + 1} OF {batch.length}</span>
+            <button disabled={reviewIndex === batch.length - 1} onClick={() => setReviewIndex((i) => i + 1)}>Next →</button>
+          </div>
+        )}
+        <button className="back-btn" onClick={scanMoreWithTemplate}>Scan more with this template</button>
+        <button className="back-btn" onClick={startOver}>← Choose different template</button>
       </div>
 
       <div className="review-grid">
-        <img src={flatSrc} alt="Scanned document" className="review-image" />
+        <img src={doc.flatSrc} alt="Scanned document" className="review-image" />
 
         <div className="review-fields">
           {results.map((r, i) => (
@@ -401,14 +491,12 @@ export default function ScanDocument({ user, authChecked }) {
                 {r.lowConfidence && <span className="low-confidence-flag"> ⚠ low confidence</span>}
               </label>
               {r.diagnostics?.corrections?.length > 0 && (
-                <p className="diagnostics-line mono-label">
-                  ADJUSTMENTS: {r.diagnostics.corrections.join(', ')}
-                </p>
+                <p className="diagnostics-line mono-label">ADJUSTMENTS: {r.diagnostics.corrections.join(', ')}</p>
               )}
               <input
                 className={`review-input ${r.lowConfidence ? 'flagged' : ''}`}
                 value={r.value}
-                onChange={(e) => updateResult(i, e.target.value)}
+                onChange={(e) => updateResult(reviewIndex, i, e.target.value)}
               />
             </div>
           ))}
@@ -422,11 +510,6 @@ export default function ScanDocument({ user, authChecked }) {
   );
 }
 
-// Wraps a single worker 'preprocess' round-trip as a Promise. Uses a
-// one-time listener rather than the persistent effect-based one (which
-// handles the capture/align flow's messages), so this can be awaited
-// cleanly inside the sequential per-field OCR loop without the two
-// message-handling paths interfering with each other.
 function requestPreprocess(worker, buffer, width, height) {
   return new Promise((resolve, reject) => {
     const handler = (e) => {
@@ -452,6 +535,10 @@ function defaultCorners(w, h) {
     { x: w * (1 - margin), y: h * (1 - margin) },
     { x: w * margin, y: h * (1 - margin) },
   ];
+}
+
+function clampInt(v, min, max) {
+  return Math.round(Math.min(Math.max(v, min), max));
 }
 
 function readFileAsDataUrl(file) {

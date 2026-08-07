@@ -112,6 +112,39 @@
   cursor: pointer;
 }
 
+.dropzone-text {
+  text-align: center;
+}
+
+.align-step {
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.doc-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.doc-nav button {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  background: transparent;
+  border: 1px solid var(--color-grid);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  color: var(--color-ink);
+}
+
+.doc-nav button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .image-wrap {
   position: relative;
   width: 100%;

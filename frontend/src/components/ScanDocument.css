@@ -239,6 +239,11 @@
   text-transform: none;
 }
 
+.diagnostics-line {
+  margin: 2px 0 6px;
+  color: var(--color-ink-muted);
+}
+
 .review-input {
   width: 100%;
   font-family: var(--font-body);

@@ -38,6 +38,28 @@ self.onmessage = async (e) => {
     return;
   }
 
+  if (type === 'preprocess') {
+    const { buffer, width, height } = e.data;
+    try {
+      const imageData = new ImageData(new Uint8ClampedArray(buffer), width, height);
+      const srcMat = cv.matFromImageData(imageData);
+      const { mat: outMat, diagnostics } = preprocessField(cv, srcMat);
+      srcMat.delete();
+
+      const outData = new Uint8ClampedArray(outMat.data);
+      const outW = outMat.cols;
+      const outH = outMat.rows;
+      outMat.delete();
+
+      self.postMessage(
+        { type: 'preprocess-result', buffer: outData.buffer, width: outW, height: outH, diagnostics },
+        [outData.buffer]
+      );
+    } catch (err) {
+      self.postMessage({ type: 'preprocess-error', message: 'Preprocessing failed: ' + err.message });
+    }
+    return;
+  }
   if (type === 'warp') {
     const { buffer, width, height, corners } = e.data;
     try {
@@ -71,6 +93,124 @@ self.onmessage = async (e) => {
 };
 
 // --- CV pipeline (self-contained — classic workers can't use ES imports) ---
+
+// Inspects a cropped field image and applies only the corrections it
+// actually needs, rather than a fixed filter chain applied to everything:
+//   - small crops get upscaled (OCR needs enough pixel height per character)
+//   - low-contrast/glary crops get CLAHE (local contrast enhancement)
+//   - too dark/bright crops get gamma correction
+//   - blurry crops get an unsharp-mask sharpen
+//   - everything finishes with adaptive thresholding, which turns whatever
+//     lighting conditions the photo had into a clean black-text-on-white
+//     image — close to Tesseract's ideal input regardless of the source
+function preprocessField(cv, srcMat) {
+  const diagnostics = { corrections: [] };
+  let current = new cv.Mat();
+  cv.cvtColor(srcMat, current, cv.COLOR_RGBA2GRAY);
+
+  // 1. Upscale small crops - OCR accuracy drops sharply once character
+  // height falls much below ~25-30px, and a small field box often starts
+  // out well under that.
+  const targetMinDim = 80;
+  const minDim = Math.min(current.rows, current.cols);
+  if (minDim > 0 && minDim < targetMinDim) {
+    const scale = targetMinDim / minDim;
+    const resized = new cv.Mat();
+    cv.resize(
+      current, resized,
+      new cv.Size(Math.round(current.cols * scale), Math.round(current.rows * scale)),
+      0, 0, cv.INTER_CUBIC
+    );
+    current.delete();
+    current = resized;
+    diagnostics.corrections.push('upscaled');
+  }
+
+  // 2. Measure brightness (mean) and contrast (std deviation)
+  const meanMat = new cv.Mat();
+  const stdMat = new cv.Mat();
+  cv.meanStdDev(current, meanMat, stdMat);
+  const brightness = meanMat.data64F[0];
+  const contrast = stdMat.data64F[0];
+  meanMat.delete();
+  stdMat.delete();
+  diagnostics.brightness = Math.round(brightness);
+  diagnostics.contrast = Math.round(contrast);
+
+  // 3. Low contrast (glare, washed-out lighting) -> CLAHE. This corrects
+  // contrast LOCALLY across regions rather than uniformly, which matters
+  // for uneven lighting like a glary whiteboard photo.
+  if (contrast < 40) {
+    const clahe = new cv.CLAHE(3.0, new cv.Size(8, 8));
+    const out = new cv.Mat();
+    clahe.apply(current, out);
+    clahe.delete();
+    current.delete();
+    current = out;
+    diagnostics.corrections.push('contrast-enhanced');
+  }
+
+  // 4. Too dark or too bright overall -> gamma correction
+  if (brightness < 90 || brightness > 200) {
+    const gamma = brightness < 90 ? 0.65 : 1.4; // <1 brightens, >1 darkens
+    const lut = new cv.Mat(1, 256, cv.CV_8U);
+    for (let i = 0; i < 256; i++) {
+      lut.data[i] = Math.min(255, Math.max(0, Math.round(Math.pow(i / 255, gamma) * 255)));
+    }
+    const out = new cv.Mat();
+    cv.LUT(current, lut, out);
+    lut.delete();
+    current.delete();
+    current = out;
+    diagnostics.corrections.push('brightness-normalized');
+  }
+
+  // 5. Blur detection (variance of Laplacian) -> unsharp mask if blurry
+  const lap = new cv.Mat();
+  cv.Laplacian(current, lap, cv.CV_64F);
+  const lapMean = new cv.Mat();
+  const lapStd = new cv.Mat();
+  cv.meanStdDev(lap, lapMean, lapStd);
+  const blurScore = Math.pow(lapStd.data64F[0], 2);
+  lap.delete();
+  lapMean.delete();
+  lapStd.delete();
+  diagnostics.blurScore = Math.round(blurScore);
+
+  if (blurScore < 100) {
+    const blurred = new cv.Mat();
+    cv.GaussianBlur(current, blurred, new cv.Size(0, 0), 3);
+    const sharpened = new cv.Mat();
+    cv.addWeighted(current, 1.5, blurred, -0.5, 0, sharpened);
+    blurred.delete();
+    current.delete();
+    current = sharpened;
+    diagnostics.corrections.push('sharpened');
+  }
+
+  // 6. Final adaptive threshold - binarizes to clean black text on white,
+  // regardless of what lighting condition the crop started in.
+  let blockSize = Math.min(31, (Math.min(current.rows, current.cols) - 1) | 1);
+  if (blockSize < 3) blockSize = 3;
+  if (blockSize % 2 === 0) blockSize -= 1;
+
+  const thresh = new cv.Mat();
+  cv.adaptiveThreshold(
+    current, thresh, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY,
+    blockSize, 15
+  );
+  current.delete();
+  current = thresh;
+  diagnostics.corrections.push('binarized');
+
+  // Convert back to RGBA - what ImageData/canvas expects downstream
+  const rgba = new cv.Mat();
+  cv.cvtColor(current, rgba, cv.COLOR_GRAY2RGBA);
+  current.delete();
+
+  return { mat: rgba, diagnostics };
+}
 
 function detectDocumentCorners(cv, srcMat) {
   const gray = new cv.Mat();

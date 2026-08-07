@@ -187,7 +187,7 @@ export default function ScanDocument({ user, authChecked }) {
       const fields = selectedTemplate.fields || [];
       for (let i = 0; i < fields.length; i++) {
         const f = fields[i];
-        setOcrProgressText(`Reading field ${i + 1} of ${fields.length}: ${f.name}`);
+        setOcrProgressText(`Reading field ${i + 1} of ${fields.length}: ${f.name} (adjusting image quality…)`);
 
         const px = Math.round(f.x * FLAT_W);
         const py = Math.round(f.y * FLAT_H);
@@ -199,10 +199,31 @@ export default function ScanDocument({ user, authChecked }) {
         cropCanvas.height = ph;
         cropCanvas.getContext('2d').drawImage(fullCanvas, px, py, pw, ph, 0, 0, pw, ph);
 
+        let ocrCanvas = cropCanvas;
+        let diagnostics = null;
+        try {
+          const cropData = cropCanvas.getContext('2d').getImageData(0, 0, pw, ph);
+          const pre = await requestPreprocess(workerCvRef.current, cropData.data.buffer, pw, ph);
+          diagnostics = pre.diagnostics;
+
+          const preCanvas = document.createElement('canvas');
+          preCanvas.width = pre.width;
+          preCanvas.height = pre.height;
+          preCanvas.getContext('2d').putImageData(
+            new ImageData(new Uint8ClampedArray(pre.buffer), pre.width, pre.height),
+            0, 0
+          );
+          ocrCanvas = preCanvas;
+        } catch (err) {
+          // Preprocessing is a quality improvement, not a hard requirement —
+          // fall back to the raw crop rather than failing the whole field.
+          console.error('Preprocessing failed for field', f.name, err);
+        }
+
         let text = '';
         let ocrConfidence = 0;
         try {
-          const { data } = await worker.recognize(cropCanvas);
+          const { data } = await worker.recognize(ocrCanvas);
           text = (data.text || '').trim();
           ocrConfidence = data.confidence ?? 0;
         } catch (err) {
@@ -214,6 +235,7 @@ export default function ScanDocument({ user, authChecked }) {
           type: f.type,
           value: text,
           lowConfidence: ocrConfidence < 60,
+          diagnostics,
         });
       }
     } finally {
@@ -378,6 +400,11 @@ export default function ScanDocument({ user, authChecked }) {
                 {r.name} · {r.type}
                 {r.lowConfidence && <span className="low-confidence-flag"> ⚠ low confidence</span>}
               </label>
+              {r.diagnostics?.corrections?.length > 0 && (
+                <p className="diagnostics-line mono-label">
+                  ADJUSTMENTS: {r.diagnostics.corrections.join(', ')}
+                </p>
+              )}
               <input
                 className={`review-input ${r.lowConfidence ? 'flagged' : ''}`}
                 value={r.value}
@@ -393,6 +420,28 @@ export default function ScanDocument({ user, authChecked }) {
       </div>
     </div>
   );
+}
+
+// Wraps a single worker 'preprocess' round-trip as a Promise. Uses a
+// one-time listener rather than the persistent effect-based one (which
+// handles the capture/align flow's messages), so this can be awaited
+// cleanly inside the sequential per-field OCR loop without the two
+// message-handling paths interfering with each other.
+function requestPreprocess(worker, buffer, width, height) {
+  return new Promise((resolve, reject) => {
+    const handler = (e) => {
+      const msg = e.data;
+      if (msg.type === 'preprocess-result') {
+        worker.removeEventListener('message', handler);
+        resolve(msg);
+      } else if (msg.type === 'preprocess-error') {
+        worker.removeEventListener('message', handler);
+        reject(new Error(msg.message));
+      }
+    };
+    worker.addEventListener('message', handler);
+    worker.postMessage({ type: 'preprocess', buffer, width, height }, [buffer]);
+  });
 }
 
 function defaultCorners(w, h) {

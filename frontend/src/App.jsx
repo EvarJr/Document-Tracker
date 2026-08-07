@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { API_BASE_URL } from './config.js';
 import TemplateUpload from './components/TemplateUpload.jsx';
 import TemplatesLibrary from './components/TemplatesLibrary.jsx';
+import ScanDocument from './components/ScanDocument.jsx';
 import { loginWithGoogle, fetchCurrentUser, exchangeCodeForSession, authFetch, logout } from './lib/auth.js';
 import './styles/tokens.css';
 import './App.css';
@@ -119,6 +120,9 @@ function App() {
           <button className={tab === 'templates' ? 'active' : ''} onClick={() => setTab('templates')}>
             Templates
           </button>
+          <button className={tab === 'scan' ? 'active' : ''} onClick={() => setTab('scan')}>
+            Scan document
+          </button>
         </div>
         <div className="auth-area">
           {!authChecked && <span className="mono-label">CHECKING...</span>}
@@ -174,6 +178,7 @@ function App() {
 
       {tab === 'upload' && <TemplateUpload />}
       {tab === 'templates' && <TemplatesLibrary user={user} authChecked={authChecked} />}
+      {tab === 'scan' && <ScanDocument user={user} authChecked={authChecked} />}
     </div>
   );
 }

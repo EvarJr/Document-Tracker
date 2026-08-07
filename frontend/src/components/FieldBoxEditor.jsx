@@ -141,19 +141,18 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
         })),
       };
 
-      try {
-        localStorage.setItem(`template:${Date.now()}`, JSON.stringify(template));
-      } catch {
-        // not fatal
-      }
-      downloadJson(template, `${slugify(template.name)}.json`);
-
       setSavedMsg('Checking sign-in status…');
       const user = await fetchCurrentUser();
 
       if (!user) {
+        // Templates now save to Drive only, which requires being signed in.
+        // We still have to carry the drawn fields through the login
+        // redirect somehow, since a full-page navigation wipes all React
+        // state — this is a short-lived transport for that purpose only,
+        // not a persistent local save. It's cleared the moment the Drive
+        // save actually completes (see App.jsx).
         localStorage.setItem('pendingTemplateSave', JSON.stringify(template));
-        setSavedMsg('Not signed in yet — redirecting to Google sign-in to save this to your Drive…');
+        setSavedMsg('Sign-in required to save to Drive — redirecting to Google sign-in…');
         setTimeout(() => loginWithGoogle(), 1200);
         return;
       }
@@ -164,10 +163,10 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
         body: JSON.stringify(template),
       });
       if (!res.ok) throw new Error(`Save failed (${res.status})`);
-      setSavedMsg('Saved to your Google Drive, in the "DocumentScannerTemplates" folder. A local backup copy was also downloaded.');
+      setSavedMsg('Saved to your Google Drive, in the "DocumentScannerTemplates" folder.');
     } catch (err) {
       console.error(err);
-      setSavedMsg('Could not save to Drive right now — a local backup copy was still downloaded. You can retry in a moment.');
+      setSavedMsg('Could not save to Drive right now. Please check your connection and try again.');
     } finally {
       setSaving(false);
     }
@@ -366,24 +365,4 @@ function resizeBox(field, handle, point, dims) {
 
 function clamp(v, min, max) {
   return Math.min(Math.max(v, min), max);
-}
-
-function downloadJson(obj, filename) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function slugify(str) {
-  return (
-    str
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/(^-|-$)/g, '') || 'template'
-  );
 }

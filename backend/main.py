@@ -42,8 +42,8 @@ app = FastAPI(title="Document Scanner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN else [],
-    allow_credentials=False,  # no longer needed - auth travels via header, not cookies
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 

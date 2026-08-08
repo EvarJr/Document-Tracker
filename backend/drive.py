@@ -195,3 +195,24 @@ async def list_all_mappings(access_token: str) -> list[dict]:
         except Exception:
             continue  # skip anything unreadable rather than failing the whole list
     return mappings
+
+
+# --- Correction history (per template, per field OCR-correction learning) ---
+
+CORRECTIONS_FOLDER = "DocumentScannerCorrections"
+
+
+def _corrections_filename(template_id: str) -> str:
+    return f"corrections_{template_id}.json"
+
+
+async def get_corrections(access_token: str, template_id: str) -> dict | None:
+    folder_id = await get_or_create_folder(access_token, CORRECTIONS_FOLDER)
+    file = await find_file_by_name(access_token, folder_id, _corrections_filename(template_id))
+    if not file:
+        return None
+    return await get_json_file_content(access_token, file["id"])
+
+
+async def save_corrections(access_token: str, template_id: str, content: dict) -> dict:
+    return await save_json_file(access_token, CORRECTIONS_FOLDER, _corrections_filename(template_id), content)

@@ -42,7 +42,7 @@ app = FastAPI(title="Document Scanner API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN else [],
-    allow_credentials=False,
+    allow_credentials=False,  # no longer needed - auth travels via header, not cookies
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
@@ -272,3 +272,22 @@ async def list_all_mappings_route(request: Request):
     access_token = await _get_access_token(request)
     mappings = await drive.list_all_mappings(access_token)
     return {"mappings": mappings}
+
+
+# --- Correction history routes (per template, per field OCR learning) ---
+
+@app.get("/corrections/{template_id}")
+async def get_corrections_route(template_id: str, request: Request):
+    access_token = await _get_access_token(request)
+    data = await drive.get_corrections(access_token, template_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No correction history yet for this template.")
+    return data
+
+
+@app.post("/corrections/{template_id}")
+async def save_corrections_route(template_id: str, request: Request):
+    access_token = await _get_access_token(request)
+    body = await request.json()
+    result = await drive.save_corrections(access_token, template_id, body)
+    return result

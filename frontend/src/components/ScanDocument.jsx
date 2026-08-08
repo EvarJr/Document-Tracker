@@ -5,6 +5,14 @@ import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
 import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
 import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, parseCellRef, toCellRef } from '../lib/excelExport.js';
+import {
+  emptyCorrectionsDoc,
+  isFieldLearningEnabled,
+  setFieldLearningEnabled,
+  suggestCorrection,
+  recordCorrectionOutcome,
+  fieldAccuracyLabel,
+} from '../lib/correctionLearning.js';
 import './ScanDocument.css';
 
 const FLAT_W = 1000;
@@ -56,6 +64,10 @@ export default function ScanDocument({ user, authChecked }) {
   const [exportError, setExportError] = useState(null);
   const [addedDocs, setAddedDocs] = useState({}); // reviewIndex -> true, once added to Excel
 
+  // --- correction-memory learning (per template, per field) ---
+  const [corrections, setCorrections] = useState(null);
+  const [correctionsLoaded, setCorrectionsLoaded] = useState(false);
+
   const workerCvRef = useRef(null);
   const rawBuffersRef = useRef({}); // id -> ArrayBuffer copy (kept off React state - large binary data)
   const awaitingIndexRef = useRef(null); // which batch index the worker's next response belongs to
@@ -96,6 +108,23 @@ export default function ScanDocument({ user, authChecked }) {
       setSelectedTemplateId(t.id);
       setPhase('prep');
       setBatch([]);
+
+      // Load correction history now (not on entering review) so
+      // suggestions are ready the moment OCR results come back.
+      setCorrectionsLoaded(false);
+      try {
+        const corrRes = await authFetch(`${API_BASE_URL}/corrections/${t.id}`);
+        if (corrRes.ok) {
+          setCorrections(await corrRes.json());
+        } else {
+          setCorrections(emptyCorrectionsDoc(t.id));
+        }
+      } catch (err) {
+        console.error(err);
+        setCorrections(emptyCorrectionsDoc(t.id));
+      } finally {
+        setCorrectionsLoaded(true);
+      }
     } catch (err) {
       console.error(err);
       setTemplatesError('Could not open that template. Try again.');
@@ -282,7 +311,19 @@ export default function ScanDocument({ user, authChecked }) {
             console.error('OCR failed for field', f.name, err);
           }
 
-          docResults.push({ name: f.name, type: f.type, value: text, lowConfidence: ocrConfidence < 60, diagnostics });
+          const fieldCorrections = corrections?.fields?.[f.name];
+          const suggestion = suggestCorrection(fieldCorrections, text);
+          const value = suggestion !== null && suggestion !== undefined ? suggestion : text;
+
+          docResults.push({
+            name: f.name,
+            type: f.type,
+            value,
+            rawOcr: text,
+            suggestion,
+            lowConfidence: ocrConfidence < 60,
+            diagnostics,
+          });
         }
 
         results.push(docResults);
@@ -295,7 +336,7 @@ export default function ScanDocument({ user, authChecked }) {
     setOcrProgressText('');
     setReviewIndex(0);
     setPhase('review');
-  }, [batch, selectedTemplate]);
+  }, [batch, selectedTemplate, corrections]);
 
   useEffect(() => {
     if (phase === 'ocr') runBatchOcr();
@@ -384,6 +425,7 @@ export default function ScanDocument({ user, authChecked }) {
 
       setExportMapping(fullMapping);
       setExportSetupMode(null);
+      await persistCorrectionsForDoc(docIndex);
       setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
     } catch (err) {
       console.error(err);
@@ -465,12 +507,59 @@ export default function ScanDocument({ user, authChecked }) {
 
       setExportMapping(updatedMapping);
       setExportSetupMode(null);
+      await persistCorrectionsForDoc(docIndex);
       setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
     } catch (err) {
       console.error(err);
       setExportError(err.message || 'Could not save to that Excel file.');
     } finally {
       setExportBusy(false);
+    }
+  };
+
+  // Records the (OCR, final-value) outcome for every field in a document,
+  // then saves the updated correction history to Drive. Called at the
+  // exact moment a document is confirmed - this IS the "verification
+  // confirmation" point the learning is keyed off of.
+  const persistCorrectionsForDoc = async (docIndex) => {
+    if (!corrections || !selectedTemplateId) return;
+    const docResults = allResults[docIndex] || [];
+
+    let updated = corrections;
+    for (const r of docResults) {
+      updated = recordCorrectionOutcome(updated, r.name, {
+        rawOcr: r.rawOcr ?? r.value,
+        suggestion: r.suggestion ?? null,
+        finalValue: r.value,
+      });
+    }
+    setCorrections({ ...updated });
+
+    try {
+      await authFetch(`${API_BASE_URL}/corrections/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+    } catch (err) {
+      // Non-fatal - the Excel record still succeeded either way, this just
+      // means the learning update didn't save this time.
+      console.error('Failed to save correction history', err);
+    }
+  };
+
+  const toggleFieldLearning = async (fieldName, enabled) => {
+    if (!corrections) return;
+    const updated = setFieldLearningEnabled({ ...corrections }, fieldName, enabled);
+    setCorrections({ ...updated });
+    try {
+      await authFetch(`${API_BASE_URL}/corrections/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+    } catch (err) {
+      console.error('Failed to save learning toggle', err);
     }
   };
 
@@ -500,6 +589,7 @@ export default function ScanDocument({ user, authChecked }) {
       if (!mapRes.ok) throw new Error('Saved the row, but failed to update the export mapping.');
 
       setExportMapping(updatedMapping);
+      await persistCorrectionsForDoc(docIndex);
       setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
     } catch (err) {
       console.error(err);
@@ -554,6 +644,8 @@ export default function ScanDocument({ user, authChecked }) {
     setUploadFileForExport(null);
     setExportError(null);
     setAddedDocs({});
+    setCorrections(null);
+    setCorrectionsLoaded(false);
     setPhase('select');
   };
 
@@ -731,22 +823,49 @@ export default function ScanDocument({ user, authChecked }) {
         <img src={doc.flatSrc} alt="Scanned document" className="review-image" />
 
         <div className="review-fields">
-          {results.map((r, i) => (
-            <div key={i} className="review-row">
-              <label className="mono-label review-label">
-                {r.name} · {r.type}
-                {r.lowConfidence && <span className="low-confidence-flag"> ⚠ low confidence</span>}
-              </label>
-              {r.diagnostics?.corrections?.length > 0 && (
-                <p className="diagnostics-line mono-label">ADJUSTMENTS: {r.diagnostics.corrections.join(', ')}</p>
-              )}
-              <input
-                className={`review-input ${r.lowConfidence ? 'flagged' : ''}`}
-                value={r.value}
-                onChange={(e) => updateResult(reviewIndex, i, e.target.value)}
-              />
-            </div>
-          ))}
+          {results.map((r, i) => {
+            const fieldLearning = corrections?.fields?.[r.name];
+            const learningEnabled = isFieldLearningEnabled(corrections, r.name);
+            const accuracyLabel = fieldAccuracyLabel(fieldLearning);
+            const suggestionApplied = r.suggestion && r.suggestion !== r.rawOcr;
+
+            return (
+              <div key={i} className="review-row">
+                <div className="review-label-row">
+                  <label className="mono-label review-label">
+                    {r.name} · {r.type}
+                    {r.lowConfidence && <span className="low-confidence-flag"> ⚠ low confidence</span>}
+                  </label>
+                  <label className="learning-toggle mono-label">
+                    <input
+                      type="checkbox"
+                      checked={learningEnabled}
+                      onChange={(e) => toggleFieldLearning(r.name, e.target.checked)}
+                    />
+                    LEARNING
+                  </label>
+                </div>
+
+                {r.diagnostics?.corrections?.length > 0 && (
+                  <p className="diagnostics-line mono-label">ADJUSTMENTS: {r.diagnostics.corrections.join(', ')}</p>
+                )}
+
+                {suggestionApplied && (
+                  <p className="suggestion-line mono-label">
+                    OCR READ: "{r.rawOcr}" → SUGGESTED: "{r.suggestion}"
+                  </p>
+                )}
+
+                {accuracyLabel && <p className="accuracy-line mono-label">{accuracyLabel}</p>}
+
+                <input
+                  className={`review-input ${r.lowConfidence ? 'flagged' : ''} ${suggestionApplied ? 'suggested' : ''}`}
+                  value={r.value}
+                  onChange={(e) => updateResult(reviewIndex, i, e.target.value)}
+                />
+              </div>
+            );
+          })}
 
           <div className="export-section">
             {!mappingChecked && <p className="mono-label">CHECKING EXCEL EXPORT SETUP...</p>}

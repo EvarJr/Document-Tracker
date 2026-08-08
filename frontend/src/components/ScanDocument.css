@@ -301,6 +301,56 @@
   color: var(--color-ink-muted);
 }
 
+.export-section {
+  border-top: 1px solid var(--color-grid);
+  margin-top: var(--space-6);
+  padding-top: var(--space-6);
+}
+
+.export-setup-prompt {
+  text-align: center;
+}
+
+.export-setup-choices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-3);
+}
+
+.export-choice-btn {
+  border: 1px solid var(--color-grid);
+  border-radius: 6px;
+  padding: 8px 16px;
+}
+
+.export-setup-panel {
+  background: var(--color-bg);
+  border: 1px solid var(--color-grid);
+  border-radius: 8px;
+  padding: var(--space-4);
+}
+
+.export-setup-panel select,
+.export-setup-panel input[type="file"] {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.export-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.added-confirmation {
+  color: var(--color-success);
+  font-weight: 600;
+  margin: 0;
+}
+
 @media (max-width: 800px) {
   .review-grid {
     grid-template-columns: 1fr;

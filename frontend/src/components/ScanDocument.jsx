@@ -4,6 +4,7 @@ import { API_BASE_URL } from '../config.js';
 import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
 import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
+import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, parseCellRef, toCellRef } from '../lib/excelExport.js';
 import './ScanDocument.css';
 
 const FLAT_W = 1000;
@@ -31,6 +32,7 @@ export default function ScanDocument({ user, authChecked }) {
   const [templates, setTemplates] = useState(null);
   const [templatesError, setTemplatesError] = useState(null);
   const [selectedTemplate, setSelectedTemplate] = useState(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState(null);
   const [loadingTemplate, setLoadingTemplate] = useState(false);
 
   // --- batch prep (per-image: upload -> detect -> correct corners -> flatten -> align offset) ---
@@ -41,6 +43,18 @@ export default function ScanDocument({ user, authChecked }) {
   const [ocrProgressText, setOcrProgressText] = useState('');
   const [allResults, setAllResults] = useState([]); // parallel array to batch
   const [reviewIndex, setReviewIndex] = useState(0);
+
+  // --- export (Excel) ---
+  const [exportMapping, setExportMapping] = useState(null); // null = not checked yet / none exists
+  const [mappingChecked, setMappingChecked] = useState(false);
+  const [exportSetupMode, setExportSetupMode] = useState(null); // null | 'new' | 'existing'
+  const [existingFiles, setExistingFiles] = useState(null);
+  const [existingFileChoice, setExistingFileChoice] = useState(''); // Drive file id, or '' for "upload new"
+  const [startCellInput, setStartCellInput] = useState('A1');
+  const [uploadFileForExport, setUploadFileForExport] = useState(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState(null);
+  const [addedDocs, setAddedDocs] = useState({}); // reviewIndex -> true, once added to Excel
 
   const workerCvRef = useRef(null);
   const rawBuffersRef = useRef({}); // id -> ArrayBuffer copy (kept off React state - large binary data)
@@ -79,6 +93,7 @@ export default function ScanDocument({ user, authChecked }) {
       if (!res.ok) throw new Error('Failed to load template content');
       const content = await res.json();
       setSelectedTemplate(content);
+      setSelectedTemplateId(t.id);
       setPhase('prep');
       setBatch([]);
     } catch (err) {
@@ -293,20 +308,252 @@ export default function ScanDocument({ user, authChecked }) {
     );
   };
 
+  // --- export (Excel) ---
+
+  useEffect(() => {
+    if (phase !== 'review' || !selectedTemplateId) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`);
+        if (cancelled) return;
+        if (res.ok) {
+          const mapping = await res.json();
+          setExportMapping(mapping);
+        } else {
+          setExportMapping(null);
+        }
+      } catch (err) {
+        console.error(err);
+        setExportMapping(null);
+      } finally {
+        if (!cancelled) setMappingChecked(true);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [phase, selectedTemplateId]);
+
+  const fieldOrder = (selectedTemplate?.fields || []).map((f) => f.name);
+
+  const valuesForDoc = (docIndex) => {
+    const doc = allResults[docIndex] || [];
+    return Object.fromEntries(doc.map((r) => [r.name, r.value]));
+  };
+
+  const loadExistingFilesList = async () => {
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      const res = await authFetch(`${API_BASE_URL}/exports`);
+      if (!res.ok) throw new Error('Could not list existing Excel files.');
+      const data = await res.json();
+      setExistingFiles(data.exports || []);
+    } catch (err) {
+      console.error(err);
+      setExportError('Could not load your existing Excel files.');
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const createNewExportFile = async (docIndex) => {
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      const { arrayBuffer, mapping } = buildNewWorkbook(fieldOrder, valuesForDoc(docIndex));
+      const filename = `${(selectedTemplate.name || 'export').replace(/[^\w\-]+/g, '_')}.xlsx`;
+
+      const form = new FormData();
+      form.append('file', new Blob([arrayBuffer], { type: 'application/octet-stream' }), filename);
+      form.append('filename', filename);
+
+      const uploadRes = await authFetch(`${API_BASE_URL}/exports`, { method: 'POST', body: form });
+      if (!uploadRes.ok) throw new Error('Failed to upload the new Excel file to Drive.');
+      const uploaded = await uploadRes.json();
+
+      const fullMapping = { ...mapping, templateId: selectedTemplateId, workbookFileId: uploaded.id };
+
+      const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fullMapping),
+      });
+      if (!mapRes.ok) throw new Error('Created the file, but failed to save the export mapping.');
+
+      setExportMapping(fullMapping);
+      setExportSetupMode(null);
+      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+    } catch (err) {
+      console.error(err);
+      setExportError(err.message || 'Could not create the Excel file.');
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const useExistingExportFile = async (docIndex) => {
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      let fileId = existingFileChoice;
+      let downloadedBytes = null;
+
+      if (!fileId && uploadFileForExport) {
+        const form = new FormData();
+        form.append('file', uploadFileForExport, uploadFileForExport.name);
+        form.append('filename', uploadFileForExport.name);
+        const uploadRes = await authFetch(`${API_BASE_URL}/exports`, { method: 'POST', body: form });
+        if (!uploadRes.ok) throw new Error('Failed to upload that file to Drive.');
+        const uploaded = await uploadRes.json();
+        fileId = uploaded.id;
+        downloadedBytes = await uploadFileForExport.arrayBuffer();
+      }
+
+      if (!fileId) throw new Error('Choose an existing file or upload one first.');
+
+      let startCell;
+      try {
+        // Validate the cell reference is well-formed before going further
+        // (parseCellRef throws on anything malformed, e.g. "5C" or "C").
+        const p = parseCellRef(startCellInput);
+        startCell = toCellRef(p.col, p.row);
+      } catch {
+        throw new Error(`"${startCellInput}" isn't a valid cell reference (try something like C4).`);
+      }
+
+      const proposedMapping = {
+        templateId: selectedTemplateId,
+        workbookFileId: fileId,
+        sheetName: 'Sheet1',
+        startCell,
+        fieldOrder,
+        nextRow: parseCellRef(startCell).row + 1,
+      };
+
+      const allMappingsRes = await authFetch(`${API_BASE_URL}/export-mappings`);
+      const allMappingsData = allMappingsRes.ok ? await allMappingsRes.json() : { mappings: [] };
+      const conflict = findConflictingMapping(proposedMapping, allMappingsData.mappings || [], selectedTemplateId);
+      if (conflict) {
+        throw new Error(
+          `That range overlaps with "${conflict.templateId}"'s data in this file. Pick a different start cell.`
+        );
+      }
+
+      if (!downloadedBytes) {
+        const fileRes = await authFetch(`${API_BASE_URL}/exports/${fileId}`);
+        if (!fileRes.ok) throw new Error('Could not read the existing file from Drive.');
+        downloadedBytes = await fileRes.arrayBuffer();
+      }
+
+      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(downloadedBytes, proposedMapping, valuesForDoc(docIndex));
+
+      const putRes = await authFetch(`${API_BASE_URL}/exports/${fileId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: arrayBuffer,
+      });
+      if (!putRes.ok) throw new Error('Failed to save the updated file back to Drive.');
+
+      const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedMapping),
+      });
+      if (!mapRes.ok) throw new Error('Saved the file, but failed to save the export mapping.');
+
+      setExportMapping(updatedMapping);
+      setExportSetupMode(null);
+      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+    } catch (err) {
+      console.error(err);
+      setExportError(err.message || 'Could not save to that Excel file.');
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const confirmAddToExcel = async (docIndex) => {
+    if (!exportMapping) return;
+    setExportBusy(true);
+    setExportError(null);
+    try {
+      const fileRes = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`);
+      if (!fileRes.ok) throw new Error('Could not read the Excel file from Drive.');
+      const bytes = await fileRes.arrayBuffer();
+
+      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(bytes, exportMapping, valuesForDoc(docIndex));
+
+      const putRes = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: arrayBuffer,
+      });
+      if (!putRes.ok) throw new Error('Failed to save the updated file back to Drive.');
+
+      const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedMapping),
+      });
+      if (!mapRes.ok) throw new Error('Saved the row, but failed to update the export mapping.');
+
+      setExportMapping(updatedMapping);
+      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+    } catch (err) {
+      console.error(err);
+      setExportError(err.message || 'Could not add this record to Excel.');
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const downloadCurrentExport = async () => {
+    if (!exportMapping) return;
+    try {
+      const res = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`);
+      if (!res.ok) throw new Error('Download failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(selectedTemplate?.name || 'export').replace(/[^\w\-]+/g, '_')}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      setExportError('Could not download the file.');
+    }
+  };
+
   const scanMoreWithTemplate = () => {
     setBatch([]);
     setCurrentIndex(0);
     setAllResults([]);
     setReviewIndex(0);
+    setAddedDocs({});
+    setExportSetupMode(null);
+    setExportError(null);
     setPhase('prep');
   };
 
   const startOver = () => {
     setSelectedTemplate(null);
+    setSelectedTemplateId(null);
     setBatch([]);
     setCurrentIndex(0);
     setAllResults([]);
     setReviewIndex(0);
+    setExportMapping(null);
+    setMappingChecked(false);
+    setExportSetupMode(null);
+    setExistingFiles(null);
+    setExistingFileChoice('');
+    setStartCellInput('A1');
+    setUploadFileForExport(null);
+    setExportError(null);
+    setAddedDocs({});
     setPhase('select');
   };
 
@@ -501,9 +748,107 @@ export default function ScanDocument({ user, authChecked }) {
             </div>
           ))}
 
-          <p className="scan-note">
-            Excel export isn't wired up yet — that's the next piece. For now, this confirms the full scan → align → OCR → review pipeline works end to end.
-          </p>
+          <div className="export-section">
+            {!mappingChecked && <p className="mono-label">CHECKING EXCEL EXPORT SETUP...</p>}
+
+            {mappingChecked && !exportMapping && !exportSetupMode && (
+              <div className="export-setup-prompt">
+                <p className="scan-subtitle">This template isn't linked to an Excel file yet.</p>
+                <div className="export-setup-choices">
+                  <button className="confirm-btn" onClick={() => setExportSetupMode('new')}>
+                    Create new Excel file
+                  </button>
+                  <button
+                    className="back-btn export-choice-btn"
+                    onClick={() => { setExportSetupMode('existing'); loadExistingFilesList(); }}
+                  >
+                    Use an existing Excel file
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {exportSetupMode === 'new' && (
+              <div className="export-setup-panel">
+                <p className="scan-subtitle">
+                  Creates a new file with headers ({fieldOrder.join(', ')}) and this document as the first row.
+                </p>
+                <div className="review-controls">
+                  <button className="back-btn" onClick={() => setExportSetupMode(null)}>Cancel</button>
+                  <button className="confirm-btn" onClick={() => createNewExportFile(reviewIndex)} disabled={exportBusy}>
+                    {exportBusy ? 'Creating…' : 'Create & add this record'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {exportSetupMode === 'existing' && (
+              <div className="export-setup-panel">
+                <label className="mono-label">EXISTING FILES IN DRIVE</label>
+                {existingFiles === null && <p className="mono-label">LOADING...</p>}
+                {existingFiles && existingFiles.length > 0 && (
+                  <select
+                    className="review-input"
+                    value={existingFileChoice}
+                    onChange={(e) => setExistingFileChoice(e.target.value)}
+                  >
+                    <option value="">— Upload a new file instead —</option>
+                    {existingFiles.map((f) => (
+                      <option key={f.id} value={f.id}>{f.name}</option>
+                    ))}
+                  </select>
+                )}
+                {!existingFileChoice && (
+                  <input
+                    type="file"
+                    accept=".xlsx"
+                    onChange={(e) => setUploadFileForExport(e.target.files?.[0] || null)}
+                  />
+                )}
+                <label className="mono-label" style={{ marginTop: 12, display: 'block' }}>
+                  START CELL (e.g. C4)
+                </label>
+                <input
+                  className="review-input"
+                  value={startCellInput}
+                  onChange={(e) => setStartCellInput(e.target.value.toUpperCase())}
+                  placeholder="A1"
+                />
+                <p className="scan-subtitle">
+                  Fields will be written starting here, using {fieldOrder.length} column{fieldOrder.length === 1 ? '' : 's'}: {fieldOrder.join(', ')}
+                </p>
+                <div className="review-controls">
+                  <button className="back-btn" onClick={() => setExportSetupMode(null)}>Cancel</button>
+                  <button className="confirm-btn" onClick={() => useExistingExportFile(reviewIndex)} disabled={exportBusy}>
+                    {exportBusy ? 'Saving…' : 'Use this file & add record'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {exportError && <p className="scan-error">{exportError}</p>}
+
+            {exportMapping && !exportSetupMode && (
+              <div className="export-actions">
+                {addedDocs[reviewIndex] ? (
+                  <p className="added-confirmation">✓ Added to Excel</p>
+                ) : (
+                  <button className="confirm-btn" onClick={() => confirmAddToExcel(reviewIndex)} disabled={exportBusy}>
+                    {exportBusy ? 'Adding…' : 'Confirm & add to Excel'}
+                  </button>
+                )}
+                <a
+                  className="back-btn"
+                  href={`https://drive.google.com/file/d/${exportMapping.workbookFileId}/view`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  View in Drive
+                </a>
+                <button className="back-btn" onClick={downloadCurrentExport}>Download .xlsx</button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

@@ -371,6 +371,21 @@
   margin-top: 6px;
 }
 
+.destination-picker {
+  margin-bottom: var(--space-4);
+}
+
+.destination-picker select {
+  width: 100%;
+  margin-top: 6px;
+}
+
+.destination-add-links {
+  display: flex;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
 .export-actions {
   display: flex;
   align-items: center;

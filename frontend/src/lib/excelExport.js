@@ -2,6 +2,26 @@ import * as XLSX from 'xlsx';
 
 // --- Cell reference math (A1 <-> {col, row}, 0-indexed internally) ---
 
+// Turns the raw list of per-template mapping documents (each either the
+// new { templateId, destinations: [...] } shape, or the old single-mapping
+// shape from before multi-destination support existed) into one flat list
+// of individual destination objects, each tagged with its templateId -
+// what the collision check actually needs to compare against.
+export function flattenAllDestinations(rawMappingDocs) {
+  const flat = [];
+  for (const doc of rawMappingDocs) {
+    if (Array.isArray(doc.destinations)) {
+      for (const d of doc.destinations) {
+        flat.push({ ...d, templateId: doc.templateId });
+      }
+    } else if (doc.workbookFileId) {
+      // Old format: the doc itself *was* the single mapping.
+      flat.push({ ...doc });
+    }
+  }
+  return flat;
+}
+
 export function parseCellRef(ref) {
   const match = /^([A-Z]+)(\d+)$/i.exec(ref.trim());
   if (!match) throw new Error(`Invalid cell reference: ${ref}`);

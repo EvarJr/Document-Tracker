@@ -4,7 +4,7 @@ import { API_BASE_URL } from '../config.js';
 import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
 import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
-import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, parseCellRef, toCellRef } from '../lib/excelExport.js';
+import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, flattenAllDestinations, parseCellRef, toCellRef } from '../lib/excelExport.js';
 import {
   emptyCorrectionsDoc,
   isFieldLearningEnabled,
@@ -53,7 +53,12 @@ export default function ScanDocument({ user, authChecked }) {
   const [reviewIndex, setReviewIndex] = useState(0);
 
   // --- export (Excel) ---
-  const [exportMapping, setExportMapping] = useState(null); // null = not checked yet / none exists
+  // A template can have MULTIPLE saved destinations (different files/cell
+  // ranges) - the user picks which one to write to each time, and can add
+  // more at any point. This is deliberately not locked to a single file
+  // after first setup.
+  const [exportDestinations, setExportDestinations] = useState([]);
+  const [selectedDestinationId, setSelectedDestinationId] = useState(null);
   const [mappingChecked, setMappingChecked] = useState(false);
   const [exportSetupMode, setExportSetupMode] = useState(null); // null | 'new' | 'existing'
   const [existingFiles, setExistingFiles] = useState(null);
@@ -62,7 +67,7 @@ export default function ScanDocument({ user, authChecked }) {
   const [uploadFileForExport, setUploadFileForExport] = useState(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState(null);
-  const [addedDocs, setAddedDocs] = useState({}); // reviewIndex -> true, once added to Excel
+  const [addedDocs, setAddedDocs] = useState({}); // `${docIndex}_${destinationId}` -> true, once added to that specific destination
 
   // --- correction-memory learning (per template, per field) ---
   const [corrections, setCorrections] = useState(null);
@@ -359,15 +364,30 @@ export default function ScanDocument({ user, authChecked }) {
       try {
         const res = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`);
         if (cancelled) return;
+
         if (res.ok) {
-          const mapping = await res.json();
-          setExportMapping(mapping);
+          const data = await res.json();
+          let destinations = data.destinations;
+
+          if (!destinations) {
+            // Backward-compat: earlier versions saved one flat mapping
+            // object directly (no destinations array). Wrap it so
+            // existing saved data keeps working under the new model.
+            destinations = data.workbookFileId
+              ? [{ ...data, id: 'dest_legacy', label: data.label || 'Existing export' }]
+              : [];
+          }
+
+          setExportDestinations(destinations);
+          setSelectedDestinationId(destinations.length > 0 ? destinations[destinations.length - 1].id : null);
         } else {
-          setExportMapping(null);
+          setExportDestinations([]);
+          setSelectedDestinationId(null);
         }
       } catch (err) {
         console.error(err);
-        setExportMapping(null);
+        setExportDestinations([]);
+        setSelectedDestinationId(null);
       } finally {
         if (!cancelled) setMappingChecked(true);
       }
@@ -377,6 +397,15 @@ export default function ScanDocument({ user, authChecked }) {
   }, [phase, selectedTemplateId]);
 
   const fieldOrder = (selectedTemplate?.fields || []).map((f) => f.name);
+  const selectedDestination = exportDestinations.find((d) => d.id === selectedDestinationId) || null;
+
+  const saveDestinations = async (updatedDestinations) => {
+    await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ templateId: selectedTemplateId, destinations: updatedDestinations }),
+    });
+  };
 
   const valuesForDoc = (docIndex) => {
     const doc = allResults[docIndex] || [];
@@ -414,19 +443,26 @@ export default function ScanDocument({ user, authChecked }) {
       if (!uploadRes.ok) throw new Error('Failed to upload the new Excel file to Drive.');
       const uploaded = await uploadRes.json();
 
-      const fullMapping = { ...mapping, templateId: selectedTemplateId, workbookFileId: uploaded.id };
+      const newDestination = {
+        ...mapping,
+        id: `dest_${Date.now()}`,
+        label: filename,
+        workbookFileId: uploaded.id,
+      };
+      const updatedDestinations = [...exportDestinations, newDestination];
 
       const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(fullMapping),
+        body: JSON.stringify({ templateId: selectedTemplateId, destinations: updatedDestinations }),
       });
       if (!mapRes.ok) throw new Error('Created the file, but failed to save the export mapping.');
 
-      setExportMapping(fullMapping);
+      setExportDestinations(updatedDestinations);
+      setSelectedDestinationId(newDestination.id);
       setExportSetupMode(null);
       await persistCorrectionsForDoc(docIndex);
-      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+      setAddedDocs((prev) => ({ ...prev, [`${docIndex}_${newDestination.id}`]: true }));
     } catch (err) {
       console.error(err);
       setExportError(err.message || 'Could not create the Excel file.');
@@ -465,8 +501,9 @@ export default function ScanDocument({ user, authChecked }) {
         throw new Error(`"${startCellInput}" isn't a valid cell reference (try something like C4).`);
       }
 
-      const proposedMapping = {
-        templateId: selectedTemplateId,
+      const proposedDestination = {
+        id: `dest_${Date.now()}`,
+        label: existingFiles?.find((f) => f.id === fileId)?.name || uploadFileForExport?.name || 'Excel file',
         workbookFileId: fileId,
         sheetName: 'Sheet1',
         startCell,
@@ -476,7 +513,12 @@ export default function ScanDocument({ user, authChecked }) {
 
       const allMappingsRes = await authFetch(`${API_BASE_URL}/export-mappings`);
       const allMappingsData = allMappingsRes.ok ? await allMappingsRes.json() : { mappings: [] };
-      const conflict = findConflictingMapping(proposedMapping, allMappingsData.mappings || [], selectedTemplateId);
+      const flatExisting = flattenAllDestinations(allMappingsData.mappings || []);
+      // Check against everything, including this template's own other
+      // destinations — two destinations pointing at overlapping columns
+      // in the same file is a real conflict regardless of which template
+      // created them.
+      const conflict = findConflictingMapping(proposedDestination, flatExisting, null);
       if (conflict) {
         throw new Error(
           `That range overlaps with "${conflict.templateId}"'s data in this file. Pick a different start cell.`
@@ -489,7 +531,7 @@ export default function ScanDocument({ user, authChecked }) {
         downloadedBytes = await fileRes.arrayBuffer();
       }
 
-      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(downloadedBytes, proposedMapping, valuesForDoc(docIndex));
+      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(downloadedBytes, proposedDestination, valuesForDoc(docIndex));
 
       const putRes = await authFetch(`${API_BASE_URL}/exports/${fileId}`, {
         method: 'PUT',
@@ -498,17 +540,19 @@ export default function ScanDocument({ user, authChecked }) {
       });
       if (!putRes.ok) throw new Error('Failed to save the updated file back to Drive.');
 
+      const updatedDestinations = [...exportDestinations, updatedMapping];
       const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updatedMapping),
+        body: JSON.stringify({ templateId: selectedTemplateId, destinations: updatedDestinations }),
       });
       if (!mapRes.ok) throw new Error('Saved the file, but failed to save the export mapping.');
 
-      setExportMapping(updatedMapping);
+      setExportDestinations(updatedDestinations);
+      setSelectedDestinationId(updatedMapping.id);
       setExportSetupMode(null);
       await persistCorrectionsForDoc(docIndex);
-      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+      setAddedDocs((prev) => ({ ...prev, [`${docIndex}_${updatedMapping.id}`]: true }));
     } catch (err) {
       console.error(err);
       setExportError(err.message || 'Could not save to that Excel file.');
@@ -564,33 +608,35 @@ export default function ScanDocument({ user, authChecked }) {
   };
 
   const confirmAddToExcel = async (docIndex) => {
-    if (!exportMapping) return;
+    if (!selectedDestination) return;
     setExportBusy(true);
     setExportError(null);
     try {
-      const fileRes = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`);
+      const fileRes = await authFetch(`${API_BASE_URL}/exports/${selectedDestination.workbookFileId}`);
       if (!fileRes.ok) throw new Error('Could not read the Excel file from Drive.');
       const bytes = await fileRes.arrayBuffer();
 
-      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(bytes, exportMapping, valuesForDoc(docIndex));
+      const { arrayBuffer, updatedMapping } = appendRowToWorkbook(bytes, selectedDestination, valuesForDoc(docIndex));
 
-      const putRes = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`, {
+      const putRes = await authFetch(`${API_BASE_URL}/exports/${selectedDestination.workbookFileId}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: arrayBuffer,
       });
       if (!putRes.ok) throw new Error('Failed to save the updated file back to Drive.');
 
+      const updatedDestinations = exportDestinations.map((d) => (d.id === selectedDestination.id ? updatedMapping : d));
+
       const mapRes = await authFetch(`${API_BASE_URL}/export-mappings/${selectedTemplateId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updatedMapping),
+        body: JSON.stringify({ templateId: selectedTemplateId, destinations: updatedDestinations }),
       });
       if (!mapRes.ok) throw new Error('Saved the row, but failed to update the export mapping.');
 
-      setExportMapping(updatedMapping);
+      setExportDestinations(updatedDestinations);
       await persistCorrectionsForDoc(docIndex);
-      setAddedDocs((prev) => ({ ...prev, [docIndex]: true }));
+      setAddedDocs((prev) => ({ ...prev, [`${docIndex}_${selectedDestination.id}`]: true }));
     } catch (err) {
       console.error(err);
       setExportError(err.message || 'Could not add this record to Excel.');
@@ -600,15 +646,15 @@ export default function ScanDocument({ user, authChecked }) {
   };
 
   const downloadCurrentExport = async () => {
-    if (!exportMapping) return;
+    if (!selectedDestination) return;
     try {
-      const res = await authFetch(`${API_BASE_URL}/exports/${exportMapping.workbookFileId}`);
+      const res = await authFetch(`${API_BASE_URL}/exports/${selectedDestination.workbookFileId}`);
       if (!res.ok) throw new Error('Download failed');
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${(selectedTemplate?.name || 'export').replace(/[^\w\-]+/g, '_')}.xlsx`;
+      a.download = selectedDestination.label || 'export.xlsx';
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -635,7 +681,8 @@ export default function ScanDocument({ user, authChecked }) {
     setCurrentIndex(0);
     setAllResults([]);
     setReviewIndex(0);
-    setExportMapping(null);
+    setExportDestinations([]);
+    setSelectedDestinationId(null);
     setMappingChecked(false);
     setExportSetupMode(null);
     setExistingFiles(null);
@@ -870,7 +917,7 @@ export default function ScanDocument({ user, authChecked }) {
           <div className="export-section">
             {!mappingChecked && <p className="mono-label">CHECKING EXCEL EXPORT SETUP...</p>}
 
-            {mappingChecked && !exportMapping && !exportSetupMode && (
+            {mappingChecked && exportDestinations.length === 0 && !exportSetupMode && (
               <div className="export-setup-prompt">
                 <p className="scan-subtitle">This template isn't linked to an Excel file yet.</p>
                 <div className="export-setup-choices">
@@ -882,6 +929,30 @@ export default function ScanDocument({ user, authChecked }) {
                     onClick={() => { setExportSetupMode('existing'); loadExistingFilesList(); }}
                   >
                     Use an existing Excel file
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {mappingChecked && exportDestinations.length > 0 && !exportSetupMode && (
+              <div className="destination-picker">
+                <label className="mono-label">ADD THIS RECORD TO</label>
+                <select
+                  className="review-input"
+                  value={selectedDestinationId || ''}
+                  onChange={(e) => setSelectedDestinationId(e.target.value)}
+                >
+                  {exportDestinations.map((d) => (
+                    <option key={d.id} value={d.id}>{d.label} · {d.startCell}</option>
+                  ))}
+                </select>
+                <div className="destination-add-links">
+                  <button className="back-btn" onClick={() => setExportSetupMode('new')}>+ New Excel file</button>
+                  <button
+                    className="back-btn"
+                    onClick={() => { setExportSetupMode('existing'); loadExistingFilesList(); }}
+                  >
+                    + Another existing file
                   </button>
                 </div>
               </div>
@@ -947,18 +1018,18 @@ export default function ScanDocument({ user, authChecked }) {
 
             {exportError && <p className="scan-error">{exportError}</p>}
 
-            {exportMapping && !exportSetupMode && (
+            {selectedDestination && !exportSetupMode && (
               <div className="export-actions">
-                {addedDocs[reviewIndex] ? (
-                  <p className="added-confirmation">✓ Added to Excel</p>
+                {selectedDestination && addedDocs[`${reviewIndex}_${selectedDestination.id}`] ? (
+                  <p className="added-confirmation">✓ Added to {selectedDestination.label}</p>
                 ) : (
                   <button className="confirm-btn" onClick={() => confirmAddToExcel(reviewIndex)} disabled={exportBusy}>
-                    {exportBusy ? 'Adding…' : 'Confirm & add to Excel'}
+                    {exportBusy ? 'Adding…' : `Confirm & add to ${selectedDestination.label}`}
                   </button>
                 )}
                 <a
                   className="back-btn"
-                  href={`https://drive.google.com/file/d/${exportMapping.workbookFileId}/view`}
+                  href={`https://drive.google.com/file/d/${selectedDestination.workbookFileId}/view`}
                   target="_blank"
                   rel="noreferrer"
                 >

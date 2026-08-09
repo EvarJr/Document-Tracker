@@ -15,7 +15,25 @@ export default function TemplatesLibrary({ user, authChecked }) {
       const res = await authFetch(`${API_BASE_URL}/templates`);
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       const data = await res.json();
-      setTemplates(data.templates || []);
+      const list = data.templates || [];
+
+      // The list endpoint only returns Drive file metadata (id, name,
+      // modifiedTime) - fetch each template's actual content in parallel
+      // to get its thumbnail and field count for a real visual preview.
+      const enriched = await Promise.all(
+        list.map(async (t) => {
+          try {
+            const contentRes = await authFetch(`${API_BASE_URL}/templates/${t.id}`);
+            if (!contentRes.ok) return t;
+            const content = await contentRes.json();
+            return { ...t, thumbnail: content.thumbnail || null, fieldCount: (content.fields || []).length };
+          } catch {
+            return t; // fall back to plain metadata if one template fails to load
+          }
+        })
+      );
+
+      setTemplates(enriched);
     } catch (err) {
       console.error(err);
       setError('Could not load templates from Drive. Try refreshing.');
@@ -67,16 +85,26 @@ export default function TemplatesLibrary({ user, authChecked }) {
         </p>
       )}
 
+      {loading && templates === null && <p className="mono-label">LOADING TEMPLATES...</p>}
+
       {templates && templates.length > 0 && (
         <div className="templates-grid">
           {templates.map((t) => (
             <div key={t.id} className="template-card">
-              <div className="template-card-bracket tl" />
-              <div className="template-card-bracket tr" />
-              <div className="template-card-bracket bl" />
-              <div className="template-card-bracket br" />
+              <div className="template-card-thumb">
+                {t.thumbnail ? (
+                  <img src={t.thumbnail} alt={t.name} />
+                ) : (
+                  <div className="template-card-noimg mono-label">NO PREVIEW</div>
+                )}
+                <div className="template-card-bracket tl" />
+                <div className="template-card-bracket tr" />
+                <div className="template-card-bracket bl" />
+                <div className="template-card-bracket br" />
+              </div>
               <p className="template-card-name">{t.name.replace(/\.json$/, '')}</p>
               <p className="mono-label template-card-meta">
+                {t.fieldCount !== undefined ? `${t.fieldCount} FIELDS · ` : ''}
                 {t.modifiedTime ? new Date(t.modifiedTime).toLocaleDateString() : ''}
               </p>
             </div>

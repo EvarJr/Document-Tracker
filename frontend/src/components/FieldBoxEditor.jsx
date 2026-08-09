@@ -126,11 +126,14 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
   const saveTemplate = async () => {
     setSaving(true);
     try {
+      const thumbnail = await generateThumbnail(imageSrc);
+
       const template = {
         name: templateName || 'Untitled template',
         createdAt: new Date().toISOString(),
         imageWidth: imgDims.w,
         imageHeight: imgDims.h,
+        thumbnail,
         fields: fields.map((f) => ({
           name: f.name,
           type: f.type,
@@ -365,4 +368,26 @@ function resizeBox(field, handle, point, dims) {
 
 function clamp(v, min, max) {
   return Math.min(Math.max(v, min), max);
+}
+
+// Downscaled JPEG thumbnail, stored inline in the template's JSON. Kept
+// deliberately small (300px wide, moderate JPEG compression) since this
+// rides along inside a Drive JSON file - a full-resolution copy would
+// bloat every template file for no real benefit at thumbnail size.
+function generateThumbnail(imageSrc, targetWidth = 300) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = targetWidth / img.naturalWidth;
+      const w = targetWidth;
+      const h = Math.round(img.naturalHeight * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL('image/jpeg', 0.6));
+    };
+    img.onerror = reject;
+    img.src = imageSrc;
+  });
 }

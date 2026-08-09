@@ -97,7 +97,22 @@ export default function ScanDocument({ user, authChecked }) {
       const res = await authFetch(`${API_BASE_URL}/templates`);
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       const data = await res.json();
-      setTemplates(data.templates || []);
+      const list = data.templates || [];
+
+      const enriched = await Promise.all(
+        list.map(async (t) => {
+          try {
+            const contentRes = await authFetch(`${API_BASE_URL}/templates/${t.id}`);
+            if (!contentRes.ok) return t;
+            const content = await contentRes.json();
+            return { ...t, thumbnail: content.thumbnail || null, fieldCount: (content.fields || []).length };
+          } catch {
+            return t;
+          }
+        })
+      );
+
+      setTemplates(enriched);
     } catch (err) {
       console.error(err);
       setTemplatesError('Could not load templates from Drive.');
@@ -807,7 +822,17 @@ export default function ScanDocument({ user, authChecked }) {
           <div className="template-picker-grid">
             {templates.map((t) => (
               <button key={t.id} className="template-picker-card" onClick={() => pickTemplate(t)} disabled={loadingTemplate}>
-                {t.name.replace(/\.json$/, '')}
+                <div className="template-picker-thumb">
+                  {t.thumbnail ? (
+                    <img src={t.thumbnail} alt={t.name} />
+                  ) : (
+                    <div className="template-picker-noimg mono-label">NO PREVIEW</div>
+                  )}
+                </div>
+                <span className="template-picker-name">{t.name.replace(/\.json$/, '')}</span>
+                {t.fieldCount !== undefined && (
+                  <span className="mono-label template-picker-meta">{t.fieldCount} FIELDS</span>
+                )}
               </button>
             ))}
           </div>

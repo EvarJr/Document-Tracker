@@ -371,6 +371,19 @@
   margin-top: 6px;
 }
 
+.manual-override {
+  margin-top: var(--space-3);
+}
+
+.manual-override summary {
+  cursor: pointer;
+  color: var(--color-ink-muted);
+}
+
+.manual-override input {
+  margin-top: 6px;
+}
+
 .destination-picker {
   margin-bottom: var(--space-4);
 }

@@ -4,7 +4,8 @@ import { API_BASE_URL } from '../config.js';
 import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
 import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
-import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, flattenAllDestinations, parseCellRef, toCellRef } from '../lib/excelExport.js';
+import SpreadsheetPicker from './SpreadsheetPicker.jsx';
+import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, flattenAllDestinations, readWorkbook, parseCellRef, toCellRef } from '../lib/excelExport.js';
 import {
   emptyCorrectionsDoc,
   isFieldLearningEnabled,
@@ -64,6 +65,10 @@ export default function ScanDocument({ user, authChecked }) {
   const [existingFiles, setExistingFiles] = useState(null);
   const [existingFileChoice, setExistingFileChoice] = useState(''); // Drive file id, or '' for "upload new"
   const [startCellInput, setStartCellInput] = useState('A1');
+  const [startSheetInput, setStartSheetInput] = useState('Sheet1');
+  const [previewWorkbook, setPreviewWorkbook] = useState(null);
+  const [previewOccupiedRanges, setPreviewOccupiedRanges] = useState([]);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [uploadFileForExport, setUploadFileForExport] = useState(null);
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState(null);
@@ -428,6 +433,79 @@ export default function ScanDocument({ user, authChecked }) {
     }
   };
 
+  const computeOccupiedRanges = async (fileId) => {
+    try {
+      const res = await authFetch(`${API_BASE_URL}/export-mappings`);
+      const data = res.ok ? await res.json() : { mappings: [] };
+      const flat = flattenAllDestinations(data.mappings || []);
+      return flat
+        .filter((d) => d.workbookFileId === fileId)
+        .map((d) => {
+          const start = parseCellRef(d.startCell);
+          return {
+            sheetName: d.sheetName || 'Sheet1',
+            startCol: start.col,
+            endCol: start.col + d.fieldOrder.length - 1,
+            label: d.label || d.templateId,
+          };
+        });
+    } catch (err) {
+      console.error('Failed to compute occupied ranges', err);
+      return [];
+    }
+  };
+
+  const loadPreviewForExistingFile = async (fileId) => {
+    setPreviewLoading(true);
+    setPreviewWorkbook(null);
+    try {
+      const [fileRes, occupied] = await Promise.all([
+        authFetch(`${API_BASE_URL}/exports/${fileId}`),
+        computeOccupiedRanges(fileId),
+      ]);
+      if (!fileRes.ok) throw new Error('Could not load that file for preview.');
+      const bytes = await fileRes.arrayBuffer();
+      const wb = readWorkbook(bytes);
+      setPreviewWorkbook(wb);
+      setPreviewOccupiedRanges(occupied);
+      setStartSheetInput(wb.SheetNames[0]);
+      setStartCellInput('');
+    } catch (err) {
+      console.error(err);
+      setExportError('Could not preview that file.');
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const loadPreviewForUploadedFile = async (file) => {
+    setPreviewLoading(true);
+    setPreviewWorkbook(null);
+    try {
+      const bytes = await file.arrayBuffer();
+      const wb = readWorkbook(bytes);
+      setPreviewWorkbook(wb);
+      setPreviewOccupiedRanges([]); // brand-new-to-us file, nothing else can reference it yet
+      setStartSheetInput(wb.SheetNames[0]);
+      setStartCellInput('');
+    } catch (err) {
+      console.error(err);
+      setExportError('Could not read that file — is it a valid .xlsx?');
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const closeExportSetup = () => {
+    setExportSetupMode(null);
+    setExistingFileChoice('');
+    setUploadFileForExport(null);
+    setPreviewWorkbook(null);
+    setPreviewOccupiedRanges([]);
+    setStartCellInput('A1');
+    setStartSheetInput('Sheet1');
+  };
+
   const createNewExportFile = async (docIndex) => {
     setExportBusy(true);
     setExportError(null);
@@ -460,7 +538,7 @@ export default function ScanDocument({ user, authChecked }) {
 
       setExportDestinations(updatedDestinations);
       setSelectedDestinationId(newDestination.id);
-      setExportSetupMode(null);
+      closeExportSetup();
       await persistCorrectionsForDoc(docIndex);
       setAddedDocs((prev) => ({ ...prev, [`${docIndex}_${newDestination.id}`]: true }));
     } catch (err) {
@@ -505,7 +583,7 @@ export default function ScanDocument({ user, authChecked }) {
         id: `dest_${Date.now()}`,
         label: existingFiles?.find((f) => f.id === fileId)?.name || uploadFileForExport?.name || 'Excel file',
         workbookFileId: fileId,
-        sheetName: 'Sheet1',
+        sheetName: startSheetInput || 'Sheet1',
         startCell,
         fieldOrder,
         nextRow: parseCellRef(startCell).row + 1,
@@ -550,7 +628,7 @@ export default function ScanDocument({ user, authChecked }) {
 
       setExportDestinations(updatedDestinations);
       setSelectedDestinationId(updatedMapping.id);
-      setExportSetupMode(null);
+      closeExportSetup();
       await persistCorrectionsForDoc(docIndex);
       setAddedDocs((prev) => ({ ...prev, [`${docIndex}_${updatedMapping.id}`]: true }));
     } catch (err) {
@@ -964,7 +1042,7 @@ export default function ScanDocument({ user, authChecked }) {
                   Creates a new file with headers ({fieldOrder.join(', ')}) and this document as the first row.
                 </p>
                 <div className="review-controls">
-                  <button className="back-btn" onClick={() => setExportSetupMode(null)}>Cancel</button>
+                  <button className="back-btn" onClick={closeExportSetup}>Cancel</button>
                   <button className="confirm-btn" onClick={() => createNewExportFile(reviewIndex)} disabled={exportBusy}>
                     {exportBusy ? 'Creating…' : 'Create & add this record'}
                   </button>
@@ -980,7 +1058,13 @@ export default function ScanDocument({ user, authChecked }) {
                   <select
                     className="review-input"
                     value={existingFileChoice}
-                    onChange={(e) => setExistingFileChoice(e.target.value)}
+                    onChange={(e) => {
+                      const fileId = e.target.value;
+                      setExistingFileChoice(fileId);
+                      setUploadFileForExport(null);
+                      if (fileId) loadPreviewForExistingFile(fileId);
+                      else { setPreviewWorkbook(null); setPreviewOccupiedRanges([]); }
+                    }}
                   >
                     <option value="">— Upload a new file instead —</option>
                     {existingFiles.map((f) => (
@@ -992,24 +1076,50 @@ export default function ScanDocument({ user, authChecked }) {
                   <input
                     type="file"
                     accept=".xlsx"
-                    onChange={(e) => setUploadFileForExport(e.target.files?.[0] || null)}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0] || null;
+                      setUploadFileForExport(file);
+                      if (file) loadPreviewForUploadedFile(file);
+                      else { setPreviewWorkbook(null); setPreviewOccupiedRanges([]); }
+                    }}
                   />
                 )}
-                <label className="mono-label" style={{ marginTop: 12, display: 'block' }}>
-                  START CELL (e.g. C4)
-                </label>
-                <input
-                  className="review-input"
-                  value={startCellInput}
-                  onChange={(e) => setStartCellInput(e.target.value.toUpperCase())}
-                  placeholder="A1"
-                />
+
+                {previewLoading && <p className="mono-label" style={{ marginTop: 12 }}>LOADING PREVIEW...</p>}
+
+                {previewWorkbook && !previewLoading && (
+                  <SpreadsheetPicker
+                    workbook={previewWorkbook}
+                    fieldCount={fieldOrder.length}
+                    occupiedRanges={previewOccupiedRanges}
+                    sheetName={startSheetInput}
+                    cellRef={startCellInput}
+                    onChange={(sheet, cell) => { setStartSheetInput(sheet); setStartCellInput(cell || ''); }}
+                  />
+                )}
+
+                {previewWorkbook && !previewLoading && (
+                  <details className="manual-override">
+                    <summary className="mono-label">Type a cell reference manually instead</summary>
+                    <input
+                      className="review-input"
+                      value={startCellInput}
+                      onChange={(e) => setStartCellInput(e.target.value.toUpperCase())}
+                      placeholder="A1"
+                    />
+                  </details>
+                )}
+
                 <p className="scan-subtitle">
-                  Fields will be written starting here, using {fieldOrder.length} column{fieldOrder.length === 1 ? '' : 's'}: {fieldOrder.join(', ')}
+                  Fields will be written starting at the selected cell, using {fieldOrder.length} column{fieldOrder.length === 1 ? '' : 's'}: {fieldOrder.join(', ')}
                 </p>
                 <div className="review-controls">
-                  <button className="back-btn" onClick={() => setExportSetupMode(null)}>Cancel</button>
-                  <button className="confirm-btn" onClick={() => useExistingExportFile(reviewIndex)} disabled={exportBusy}>
+                  <button className="back-btn" onClick={closeExportSetup}>Cancel</button>
+                  <button
+                    className="confirm-btn"
+                    onClick={() => useExistingExportFile(reviewIndex)}
+                    disabled={exportBusy || !startCellInput}
+                  >
                     {exportBusy ? 'Saving…' : 'Use this file & add record'}
                   </button>
                 </div>

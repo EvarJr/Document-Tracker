@@ -1,5 +1,9 @@
 import * as XLSX from 'xlsx';
 
+export function readWorkbook(arrayBuffer) {
+  return XLSX.read(arrayBuffer, { type: 'array' });
+}
+
 // --- Cell reference math (A1 <-> {col, row}, 0-indexed internally) ---
 
 // Turns the raw list of per-template mapping documents (each either the

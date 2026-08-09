@@ -1,0 +1,126 @@
+.spreadsheet-picker {
+  margin-top: var(--space-3);
+}
+
+.sheet-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: var(--space-2);
+  border-bottom: 1px solid var(--color-grid);
+}
+
+.sheet-tabs button {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 6px 12px;
+  cursor: pointer;
+  color: var(--color-ink-muted);
+}
+
+.sheet-tabs button.active {
+  color: var(--color-ink);
+  border-bottom-color: var(--color-accent-red);
+  font-weight: 600;
+}
+
+.occupied-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+  color: var(--color-ink-muted);
+}
+
+.occupied-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.occupied-swatch {
+  width: 10px;
+  height: 10px;
+  background: rgba(230, 57, 70, 0.25);
+  border: 1px solid var(--color-accent-red);
+  display: inline-block;
+}
+
+.grid-scroll {
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--color-grid);
+  border-radius: 6px;
+}
+
+.preview-grid {
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.preview-grid th,
+.preview-grid td {
+  border: 1px solid var(--color-grid);
+  padding: 3px 8px;
+  white-space: nowrap;
+  min-width: 60px;
+}
+
+.preview-grid thead th {
+  position: sticky;
+  top: 0;
+  background: #fff;
+  color: var(--color-ink-muted);
+  z-index: 2;
+}
+
+.preview-grid .corner-cell {
+  position: sticky;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  background: #fff;
+}
+
+.preview-grid .row-label {
+  position: sticky;
+  left: 0;
+  background: #fff;
+  color: var(--color-ink-muted);
+  z-index: 1;
+}
+
+.preview-grid td {
+  cursor: pointer;
+  color: var(--color-ink);
+}
+
+.preview-grid td:hover {
+  background: var(--color-bg);
+}
+
+.preview-grid td.occupied {
+  background: rgba(230, 57, 70, 0.08);
+}
+
+.preview-grid td.selected-span {
+  background: rgba(45, 91, 255, 0.15);
+}
+
+.preview-grid td.selected-start {
+  background: var(--color-accent-blue);
+  color: #fff;
+  font-weight: 600;
+}
+
+.show-more-btn {
+  margin-top: var(--space-2);
+}
+
+.picker-status {
+  margin-top: var(--space-2);
+  color: var(--color-accent-blue);
+}

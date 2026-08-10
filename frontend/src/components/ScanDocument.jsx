@@ -14,12 +14,22 @@ import {
   recordCorrectionOutcome,
   fieldAccuracyLabel,
 } from '../lib/correctionLearning.js';
+import {
+  emptyAlignmentDoc,
+  isAlignmentLearningEnabled,
+  setAlignmentLearningEnabled,
+  applyCornerBias,
+  recordCornerCorrection,
+  getAlignmentOffsetDefault,
+  recordAlignmentCorrection,
+  alignmentLearningSummary,
+} from '../lib/alignmentLearning.js';
 import './ScanDocument.css';
 
 const FLAT_W = 1000;
 const FLAT_H = Math.round(FLAT_W * 1.294); // must match backend/worker's flatten output size
 
-function newBatchItem(id, file) {
+function newBatchItem(id, file, defaultAlignOffset = { dx: 0, dy: 0 }) {
   return {
     id,
     file,
@@ -28,9 +38,10 @@ function newBatchItem(id, file) {
     stage: null, // UPLOADING | DETECTING | REVIEW_CORNERS | ALIGNING_WARP | ALIGN_FIELDS | DONE
     error: null,
     editableCorners: null,
+    rawDetectedCorners: null, // unbiased detection, kept separate for learning
     confidence: null,
     flatSrc: null,
-    alignOffset: { dx: 0, dy: 0 },
+    alignOffset: defaultAlignOffset,
   };
 }
 
@@ -77,6 +88,9 @@ export default function ScanDocument({ user, authChecked }) {
   // --- correction-memory learning (per template, per field) ---
   const [corrections, setCorrections] = useState(null);
   const [correctionsLoaded, setCorrectionsLoaded] = useState(false);
+
+  // --- alignment learning (corner-detection bias + alignment-offset bias, per template) ---
+  const [alignmentLearning, setAlignmentLearning] = useState(null);
 
   const workerCvRef = useRef(null);
   const rawBuffersRef = useRef({}); // id -> ArrayBuffer copy (kept off React state - large binary data)
@@ -150,6 +164,21 @@ export default function ScanDocument({ user, authChecked }) {
       } finally {
         setCorrectionsLoaded(true);
       }
+
+      // Same idea for corner/alignment learning - load it before any file
+      // is uploaded, so the very first detection this session already
+      // benefits from past corrections.
+      try {
+        const alignRes = await authFetch(`${API_BASE_URL}/alignment-learning/${t.id}`);
+        if (alignRes.ok) {
+          setAlignmentLearning(await alignRes.json());
+        } else {
+          setAlignmentLearning(emptyAlignmentDoc(t.id));
+        }
+      } catch (err) {
+        console.error(err);
+        setAlignmentLearning(emptyAlignmentDoc(t.id));
+      }
     } catch (err) {
       console.error(err);
       setTemplatesError('Could not open that template. Try again.');
@@ -197,7 +226,8 @@ export default function ScanDocument({ user, authChecked }) {
     const fileArray = Array.from(files);
     if (fileArray.length === 0) return;
 
-    const items = fileArray.map((f, i) => newBatchItem(`${Date.now()}_${i}`, f));
+    const defaultOffset = getAlignmentOffsetDefault(alignmentLearning);
+    const items = fileArray.map((f, i) => newBatchItem(`${Date.now()}_${i}`, f, { ...defaultOffset }));
     setBatch(items);
     setCurrentIndex(0);
     // item is passed directly (not read back from state), so there's no
@@ -206,9 +236,31 @@ export default function ScanDocument({ user, authChecked }) {
     processItem(0, items[0]);
   };
 
+  const persistAlignmentLearning = async (updated) => {
+    setAlignmentLearning(updated);
+    try {
+      await authFetch(`${API_BASE_URL}/alignment-learning/${selectedTemplateId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      });
+    } catch (err) {
+      console.error('Failed to save alignment learning', err);
+    }
+  };
+
+  const toggleAlignmentLearning = (enabled) => {
+    persistAlignmentLearning(setAlignmentLearningEnabled(alignmentLearning || emptyAlignmentDoc(selectedTemplateId), enabled));
+  };
+
   const confirmCorners = (index) => {
     const item = batch[index];
     if (!item?.editableCorners) return;
+
+    if (item.rawDetectedCorners) {
+      const updated = recordCornerCorrection(alignmentLearning, item.rawDetectedCorners, item.editableCorners, item.previewDims);
+      persistAlignmentLearning(updated);
+    }
 
     patchItem(index, { stage: 'ALIGNING_WARP' });
     const buffer = rawBuffersRef.current[item.id];
@@ -227,6 +279,12 @@ export default function ScanDocument({ user, authChecked }) {
   };
 
   const confirmAlignment = (index) => {
+    const item = batch[index];
+    if (item) {
+      const updated = recordAlignmentCorrection(alignmentLearning, item.alignOffset);
+      persistAlignmentLearning(updated);
+    }
+
     patchItem(index, { stage: 'DONE' });
     const nextIndex = index + 1;
     if (nextIndex < batch.length) {
@@ -253,9 +311,12 @@ export default function ScanDocument({ user, authChecked }) {
       if (msg.type === 'detect-result') {
         const item = batch[index];
         const dims = item?.previewDims || { w: 0, h: 0 };
+        const rawCorners = msg.corners || defaultCorners(dims.w, dims.h);
+        const biasedCorners = applyCornerBias(alignmentLearning, rawCorners, dims);
         patchItem(index, {
           confidence: msg.confidence,
-          editableCorners: msg.corners || defaultCorners(dims.w, dims.h),
+          rawDetectedCorners: rawCorners,
+          editableCorners: biasedCorners,
           stage: 'REVIEW_CORNERS',
         });
         return;
@@ -272,7 +333,7 @@ export default function ScanDocument({ user, authChecked }) {
     w.addEventListener('message', onMessage);
     return () => w.removeEventListener('message', onMessage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batch]);
+  }, [batch, alignmentLearning]);
 
   // --- batch OCR, once every item has confirmed corners + alignment ---
 
@@ -786,6 +847,7 @@ export default function ScanDocument({ user, authChecked }) {
     setAddedDocs({});
     setCorrections(null);
     setCorrectionsLoaded(false);
+    setAlignmentLearning(null);
     setPhase('select');
   };
 
@@ -882,6 +944,22 @@ export default function ScanDocument({ user, authChecked }) {
         <p className="scan-subtitle">
           Correct edges and alignment for every document before scanning begins — document {currentIndex + 1} of {total}.
         </p>
+
+        <div className="alignment-learning-bar">
+          <label className="learning-toggle mono-label">
+            <input
+              type="checkbox"
+              checked={isAlignmentLearningEnabled(alignmentLearning)}
+              onChange={(e) => toggleAlignmentLearning(e.target.checked)}
+            />
+            EDGE/ALIGNMENT LEARNING
+          </label>
+          {alignmentLearningSummary(alignmentLearning) && (
+            <span className="mono-label alignment-learning-summary">
+              {alignmentLearningSummary(alignmentLearning)}
+            </span>
+          )}
+        </div>
 
         <div className="scan-canvas-area">
           {item.previewSrc && (item.stage === 'DETECTING' || item.stage === 'REVIEW_CORNERS') && (

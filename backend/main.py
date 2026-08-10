@@ -291,3 +291,22 @@ async def save_corrections_route(template_id: str, request: Request):
     body = await request.json()
     result = await drive.save_corrections(access_token, template_id, body)
     return result
+
+
+# --- Alignment learning routes (corner-detection bias + alignment-offset bias) ---
+
+@app.get("/alignment-learning/{template_id}")
+async def get_alignment_learning_route(template_id: str, request: Request):
+    access_token = await _get_access_token(request)
+    data = await drive.get_alignment_learning(access_token, template_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No alignment learning yet for this template.")
+    return data
+
+
+@app.post("/alignment-learning/{template_id}")
+async def save_alignment_learning_route(template_id: str, request: Request):
+    access_token = await _get_access_token(request)
+    body = await request.json()
+    result = await drive.save_alignment_learning(access_token, template_id, body)
+    return result

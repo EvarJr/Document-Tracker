@@ -216,3 +216,24 @@ async def get_corrections(access_token: str, template_id: str) -> dict | None:
 
 async def save_corrections(access_token: str, template_id: str, content: dict) -> dict:
     return await save_json_file(access_token, CORRECTIONS_FOLDER, _corrections_filename(template_id), content)
+
+
+# --- Alignment learning (per template: corner-detection bias + alignment-offset bias) ---
+
+ALIGNMENT_FOLDER = "DocumentScannerAlignmentLearning"
+
+
+def _alignment_filename(template_id: str) -> str:
+    return f"alignment_{template_id}.json"
+
+
+async def get_alignment_learning(access_token: str, template_id: str) -> dict | None:
+    folder_id = await get_or_create_folder(access_token, ALIGNMENT_FOLDER)
+    file = await find_file_by_name(access_token, folder_id, _alignment_filename(template_id))
+    if not file:
+        return None
+    return await get_json_file_content(access_token, file["id"])
+
+
+async def save_alignment_learning(access_token: str, template_id: str, content: dict) -> dict:
+    return await save_json_file(access_token, ALIGNMENT_FOLDER, _alignment_filename(template_id), content)

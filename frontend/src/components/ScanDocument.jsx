@@ -5,6 +5,7 @@ import { authFetch, loginWithGoogle } from '../lib/auth.js';
 import CornerEditor from './CornerEditor.jsx';
 import AlignmentOffsetEditor from './AlignmentOffsetEditor.jsx';
 import SpreadsheetPicker from './SpreadsheetPicker.jsx';
+import MobileConnect from './MobileConnect.jsx';
 import { buildNewWorkbook, appendRowToWorkbook, findConflictingMapping, flattenAllDestinations, readWorkbook, parseCellRef, toCellRef } from '../lib/excelExport.js';
 import {
   emptyCorrectionsDoc,
@@ -58,6 +59,8 @@ export default function ScanDocument({ user, authChecked }) {
   // --- batch prep (per-image: upload -> detect -> correct corners -> flatten -> align offset) ---
   const [batch, setBatch] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [showMobileConnect, setShowMobileConnect] = useState(false);
+  const [phonePhotos, setPhonePhotos] = useState([]);
 
   // --- OCR + review ---
   const [ocrProgressText, setOcrProgressText] = useState('');
@@ -825,6 +828,7 @@ export default function ScanDocument({ user, authChecked }) {
     setAddedDocs({});
     setExportSetupMode(null);
     setExportError(null);
+    setPhonePhotos([]);
     setPhase('prep');
   };
 
@@ -848,6 +852,7 @@ export default function ScanDocument({ user, authChecked }) {
     setCorrections(null);
     setCorrectionsLoaded(false);
     setAlignmentLearning(null);
+    setPhonePhotos([]);
     setPhase('select');
   };
 
@@ -925,6 +930,38 @@ export default function ScanDocument({ user, authChecked }) {
                 <p className="scan-subtitle">You can select multiple photos at once — each gets aligned before scanning.</p>
               </div>
             </label>
+
+            <button
+              type="button"
+              className="connect-phone-btn"
+              onClick={() => setShowMobileConnect(true)}
+            >
+              📱 Connect phone instead
+            </button>
+
+            {showMobileConnect && (
+              <MobileConnect
+                onImagesReceived={(files) => setPhonePhotos((prev) => [...prev, ...files])}
+                onClose={() => setShowMobileConnect(false)}
+                footer={
+                  <div className="mobile-connect-footer">
+                    <button
+                      className="confirm-btn"
+                      disabled={phonePhotos.length === 0}
+                      onClick={() => {
+                        onFilesChosen(phonePhotos);
+                        setPhonePhotos([]);
+                        setShowMobileConnect(false);
+                      }}
+                    >
+                      {phonePhotos.length === 0
+                        ? 'Waiting for photos…'
+                        : `Start scanning with ${phonePhotos.length} photo${phonePhotos.length === 1 ? '' : 's'} →`}
+                    </button>
+                  </div>
+                }
+              />
+            )}
           </div>
         </div>
       );

@@ -93,6 +93,22 @@
 .dropzone-bracket.bl { bottom: 0; left: 0; border-bottom-width: 2px; border-left-width: 2px; }
 .dropzone-bracket.br { bottom: 0; right: 0; border-bottom-width: 2px; border-right-width: 2px; }
 
+.connect-phone-btn {
+  margin-top: var(--space-4);
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  background: transparent;
+  border: 1px solid var(--color-grid);
+  border-radius: 20px;
+  padding: 8px 16px;
+  cursor: pointer;
+  color: var(--color-ink);
+}
+
+.connect-phone-btn:hover {
+  border-color: var(--color-accent-blue);
+}
+
 .image-wrap {
   position: relative;
   width: 100%;

@@ -3,11 +3,20 @@ import { API_BASE_URL } from './config.js';
 import TemplateUpload from './components/TemplateUpload.jsx';
 import TemplatesLibrary from './components/TemplatesLibrary.jsx';
 import ScanDocument from './components/ScanDocument.jsx';
+import MobileCapture from './components/MobileCapture.jsx';
 import { loginWithGoogle, fetchCurrentUser, exchangeCodeForSession, authFetch, logout } from './lib/auth.js';
 import './styles/tokens.css';
 import './App.css';
 
 function App() {
+  // Detected once, synchronously, before any state/effects run - a phone
+  // that scanned the QR code lands here with no interest in the normal
+  // app shell, auth status, or backend health check, so we short-circuit
+  // straight to the capture page and skip that unrelated work entirely.
+  const urlParams = new URLSearchParams(window.location.search);
+  const isMobileCaptureMode = urlParams.get('mobile') === '1';
+  const pairingIdFromUrl = urlParams.get('pairing');
+
   const [backendStatus, setBackendStatus] = useState('checking...');
   const [tab, setTab] = useState('status');
   const [user, setUser] = useState(null);
@@ -15,18 +24,21 @@ function App() {
   const [authNotice, setAuthNotice] = useState(null);
 
   useEffect(() => {
+    if (isMobileCaptureMode) return;
     fetch(`${API_BASE_URL}/health`)
       .then((res) => res.json())
       .then((data) => setBackendStatus(data.status === 'ok' ? 'connected' : 'unexpected response'))
       .catch(() => setBackendStatus('unreachable (backend may be waking up, try again shortly)'));
-  }, []);
+  }, [isMobileCaptureMode]);
 
   useEffect(() => {
+    if (isMobileCaptureMode) return;
     async function init() {
       const params = new URLSearchParams(window.location.search);
       const authResult = params.get('auth');
       const code = params.get('code');
       let currentUser = null;
+
 
       if (authResult === 'success' && code) {
         // Redeem the one-time code from the login redirect for a real session token.
@@ -96,12 +108,16 @@ function App() {
     }
 
     init();
-  }, []);
+  }, [isMobileCaptureMode]);
 
   const handleLogout = async () => {
     await logout();
     setUser(null);
   };
+
+  if (isMobileCaptureMode) {
+    return <MobileCapture pairingId={pairingIdFromUrl} />;
+  }
 
   return (
     <div className="app-root">

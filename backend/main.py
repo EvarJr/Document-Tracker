@@ -23,6 +23,7 @@ browser redirect), so it's unaffected by any of the above.
 import os
 import secrets
 import time
+import base64
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +33,7 @@ from urllib.parse import urlparse
 import google_oauth
 import security
 import drive
+import pairing
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 _parsed = urlparse(FRONTEND_URL)
@@ -310,3 +312,48 @@ async def save_alignment_learning_route(template_id: str, request: Request):
     body = await request.json()
     result = await drive.save_alignment_learning(access_token, template_id, body)
     return result
+
+
+# --- Mobile pairing routes (QR-based phone camera connection) ---
+
+@app.post("/pairing")
+async def create_pairing_route(request: Request):
+    # Requires the desktop's own session - only a signed-in desktop user
+    # can generate a QR code in the first place.
+    session = _get_session(request)
+    return pairing.create_pairing(session["email"])
+
+
+@app.post("/pairing/{pairing_id}/upload")
+async def upload_pairing_image(pairing_id: str, request: Request):
+    # Deliberately NOT behind _get_session - the whole point is the phone
+    # doesn't need its own login, just the pairing code from the QR.
+    p = pairing.get_pairing(pairing_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="This pairing code has expired or doesn't exist.")
+
+    form = await request.form()
+    upload = form.get("file")
+    if not upload:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    content = await upload.read()
+    mime = upload.content_type or "image/jpeg"
+    data_url = f"data:{mime};base64,{base64.b64encode(content).decode()}"
+    pairing.add_image(pairing_id, data_url)
+    return {"status": "ok"}
+
+
+@app.get("/pairing/{pairing_id}/images")
+async def get_pairing_images(pairing_id: str, request: Request):
+    session = _get_session(request)
+    p = pairing.get_pairing(pairing_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="This pairing session has expired.")
+    if p["owner_email"] != session["email"]:
+        # A different signed-in user's session id somehow matched - refuse
+        # rather than hand back another person's photos.
+        raise HTTPException(status_code=403, detail="This pairing session belongs to a different account.")
+
+    images = pairing.pop_images(pairing_id)
+    return {"images": images, "expiresAt": p["expires_at"]}

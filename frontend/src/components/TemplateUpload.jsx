@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import CornerEditor from './CornerEditor.jsx';
 import FieldBoxEditor from './FieldBoxEditor.jsx';
+import MobileConnect from './MobileConnect.jsx';
 import './TemplateUpload.css';
 
 const STAGES = ['UPLOADING', 'DETECTING', 'REVIEW', 'ALIGNING', 'DONE'];
@@ -18,6 +19,7 @@ export default function TemplateUpload() {
   const [confidence, setConfidence] = useState(null);
   const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
   const [showFieldEditor, setShowFieldEditor] = useState(false);
+  const [showMobileConnect, setShowMobileConnect] = useState(false);
 
   const fileInputRef = useRef(null);
   const workerRef = useRef(null);
@@ -227,6 +229,28 @@ export default function TemplateUpload() {
               <p className="mono-label">DROP OR CLICK TO UPLOAD</p>
               <p className="dropzone-hint">A photo of a blank document template</p>
             </label>
+          )}
+
+          {!previewSrc && (
+            <button
+              type="button"
+              className="connect-phone-btn"
+              onClick={(e) => { e.preventDefault(); setShowMobileConnect(true); }}
+            >
+              📱 Connect phone instead
+            </button>
+          )}
+
+          {showMobileConnect && (
+            <MobileConnect
+              onImagesReceived={(files) => {
+                if (files.length > 0) {
+                  handleFile(files[files.length - 1]);
+                  setShowMobileConnect(false);
+                }
+              }}
+              onClose={() => setShowMobileConnect(false)}
+            />
           )}
 
           {previewSrc && !flatSrc && (

@@ -44,6 +44,13 @@
   margin-bottom: var(--space-8);
 }
 
+.capture-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: center;
+}
+
 .capture-btn {
   display: inline-block;
   font-family: var(--font-body);
@@ -56,15 +63,94 @@
   cursor: pointer;
 }
 
+.capture-btn.secondary {
+  background: transparent;
+  color: var(--color-ink);
+  border: 2px solid var(--color-grid);
+  font-size: 1rem;
+  padding: 14px 40px;
+}
+
 .capture-btn.busy {
   opacity: 0.6;
   cursor: wait;
 }
 
+.selected-files-panel {
+  margin-top: var(--space-6);
+  background: #fff;
+  border: 1px solid var(--color-grid);
+  border-radius: 8px;
+  padding: var(--space-4);
+  width: 100%;
+  max-width: 320px;
+  text-align: left;
+}
+
+.selected-files-list {
+  list-style: none;
+  margin: var(--space-2) 0;
+  padding: 0;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.selected-files-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 4px 0;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--color-bg);
+}
+
+.selected-files-list li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-files-list button {
+  background: transparent;
+  border: none;
+  color: var(--color-ink-muted);
+  font-size: 1.1rem;
+  cursor: pointer;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.selected-files-list button:hover {
+  color: var(--color-accent-red);
+}
+
+.upload-btn {
+  width: 100%;
+  font-family: var(--font-body);
+  font-weight: 600;
+  background: var(--color-accent-blue);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 12px;
+  cursor: pointer;
+  margin-top: var(--space-2);
+}
+
+.upload-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.capture-done-panel {
+  margin-top: var(--space-6);
+}
+
 .capture-success {
   color: var(--color-success);
-  margin-top: var(--space-4);
   font-weight: 600;
+  margin: 0 0 4px;
 }
 
 .capture-error {
@@ -75,6 +161,6 @@
 .capture-hint {
   color: var(--color-ink-muted);
   font-size: 0.85rem;
-  margin-top: var(--space-8);
+  margin-top: var(--space-6);
   max-width: 260px;
 }

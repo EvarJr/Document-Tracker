@@ -76,9 +76,18 @@ export async function logout() {
 
 // Drop-in replacement for fetch() that automatically attaches the bearer
 // token — use this for every call to a protected backend route.
-export function authFetch(url, options = {}) {
-  return fetch(url, {
+export async function authFetch(url, options = {}) {
+  const res = await fetch(url, {
     ...options,
     headers: { ...(options.headers || {}), ...authHeaders() },
   });
+
+  if (res.status === 401) {
+    // The token is provably dead (expired/revoked) - clear it now so a
+    // page refresh correctly shows "signed out" instead of continuing to
+    // silently fail every request with the same stale token.
+    clearToken();
+  }
+
+  return res;
 }

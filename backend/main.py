@@ -167,7 +167,18 @@ def _get_session(request: Request) -> dict:
 
 async def _get_access_token(request: Request) -> str:
     session = _get_session(request)
-    tokens = await google_oauth.refresh_access_token(session["refresh_token"])
+    try:
+        tokens = await google_oauth.refresh_access_token(session["refresh_token"])
+    except Exception:
+        # A failed refresh (expired/revoked grant, etc.) must never surface
+        # as an unhandled 500 - FastAPI's CORS middleware only attaches its
+        # headers to responses it handles cleanly, so letting this crash
+        # shows up in the browser as a confusing "CORS error" that has
+        # nothing to do with CORS. A clean 401 tells the frontend plainly:
+        # the session is dead, sign in again - and Google's Testing-mode
+        # refresh tokens expire after 7 days, so this will happen
+        # periodically until the app is out of Testing status.
+        raise HTTPException(status_code=401, detail="Your Google session has expired. Please sign in again.")
     return tokens["access_token"]
 
 

@@ -20,6 +20,7 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
   const [drawingBox, setDrawingBox] = useState(null);
   const [savedMsg, setSavedMsg] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [saveSucceeded, setSaveSucceeded] = useState(false);
 
   const svgRef = useRef(null);
   const dragState = useRef(null);
@@ -125,6 +126,7 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
 
   const saveTemplate = async () => {
     setSaving(true);
+    setSaveSucceeded(false);
     try {
       const thumbnail = await generateThumbnail(imageSrc);
 
@@ -167,6 +169,7 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
       });
       if (!res.ok) throw new Error(`Save failed (${res.status})`);
       setSavedMsg('Saved to your Google Drive, in the "DocumentScannerTemplates" folder.');
+      setSaveSucceeded(true);
     } catch (err) {
       console.error(err);
       setSavedMsg('Could not save to Drive right now. Please check your connection and try again.');
@@ -288,6 +291,14 @@ export default function FieldBoxEditor({ imageSrc, initialTemplateName = '', onB
           )}
 
           {savedMsg && <p className="saved-msg">{savedMsg}</p>}
+
+          {saveSucceeded && (
+            <div className="save-success-actions">
+              <button className="save-template-btn" onClick={onBack}>
+                ← Back to upload — scan the next document
+              </button>
+            </div>
+          )}
         </aside>
       </div>
     </div>
